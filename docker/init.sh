@@ -120,6 +120,7 @@ frappe.init(site, sites_path='/home/frappe/bench/sites')
 frappe.connect()
 config = frappe.get_single('Vendor Config')
 config.hub_url = 'http://hub:8000'
+config.hub_site = 'saathimart.localhost'
 config.vendor_id = vendor_id
 config.api_key = f'vendor-api-key-{vendor_id}'
 config.api_secret = f'vendor-api-secret-{vendor_id}'
@@ -150,13 +151,52 @@ else:
     config.address = 'Kathmandu, Nepal'
     config.service_radius_km = 5
 
-config.default_warehouse = 'Stores - SM'
+# default_warehouse is the single warehouse Sales Orders get fulfilled
+# from and stock levels get read from (see utils.py/tasks.py/vendor_order.py)
+# — ERPNext requires exactly one warehouse per order line, so "all of the
+# vendor's stock" isn't a valid substitute. If this vendor already has a
+# real warehouse (a pre-existing site with its own Company), use that
+# instead of ever touching/creating our own.
+existing_warehouse = frappe.db.get_value(
+    'Warehouse', {'disabled': 0}, 'name', order_by='creation asc'
+)
+
+if existing_warehouse:
+    config.default_warehouse = existing_warehouse
+else:
+    # Nothing exists yet (fresh demo site: no Setup Wizard has ever run
+    # here, so there's no Company/Warehouse to point at at all). Bootstrap
+    # the same base fixtures the wizard would have installed — Company.
+    # on_update's create_default_warehouses() needs "Warehouse Type:
+    # Transit" to exist — then a demo Company so a real warehouse exists.
+    from erpnext.setup.setup_wizard.operations.install_fixtures import install as install_erpnext_fixtures
+    if not frappe.db.exists('Warehouse Type', 'Transit'):
+        install_erpnext_fixtures(country='Nepal')
+        frappe.db.commit()
+
+    company_name = 'SaathiMart Vendor'
+    abbr = 'SM'
+    if not frappe.db.exists('Company', company_name):
+        frappe.get_doc({
+            'doctype': 'Company',
+            'company_name': company_name,
+            'abbr': abbr,
+            'default_currency': 'NPR',
+            'country': 'Nepal',
+        }).insert(ignore_permissions=True)
+        frappe.db.commit()
+
+    config.default_warehouse = f'Stores - {abbr}'
+
 config.save(ignore_permissions=True)
 frappe.db.commit()
 print(f'  Vendor Config saved for {vendor_id}')
 PYEOF
+done
 
-# Sync vendor location to hub
+# Sync vendor location to hub. Runs once, after every site above has been
+# created/configured — nesting this inside the site-provisioning loop
+# would (and used to) try to sync not-yet-created later sites too early.
 echo "Syncing vendor locations to hub..."
 for SITE in $VENDOR_SITES; do
   cd "$BENCH" && "$BENCH/env/bin/python" - "$SITE" <<'PYEOF'
@@ -172,7 +212,6 @@ try:
 except Exception as e:
     print(f'  Location sync failed for {site}: {e}')
 PYEOF
-done
 done
 
 bench build --app saathimart_vendor || true

@@ -5,7 +5,8 @@
   "istable": 1,
   "fields": [
    {"fieldname": "product", "fieldtype": "Data", "label": "Hub Product ID", "reqd": 1},
-   {"fieldname": "item_code", "fieldtype": "Link", "label": "ERPNext Item", "options": "Item", "reqd": 1},
+   {"fieldname": "item_code", "fieldtype": "Link", "label": "ERPNext Item", "options": "Item",
+    "description": "Resolved from Product Mapping by accept_order() at accept time — a fresh inbound hub order legitimately has no ERPNext item_code yet, since the hub only knows its own product id (see 'product' above)."},
    {"fieldname": "col_break_1", "fieldtype": "Column Break"},
    {"fieldname": "qty", "fieldtype": "Float", "label": "Qty", "reqd": 1, "default": "1"},
    {"fieldname": "rate", "fieldtype": "Currency", "label": "Rate", "reqd": 1, "default": "0"},

@@ -136,7 +136,7 @@ def hub_get(config, method, params=None):
         resp = requests.get(
             f"{config.hub_url}/api/method/{method}",
             params=params or {},
-            headers=_hub_headers(config),
+            headers=hub_headers(config),
             timeout=10,
         )
         if resp.ok:
@@ -155,7 +155,7 @@ def hub_post(config, method, payload):
         resp = requests.post(
             f"{config.hub_url}/api/method/{method}",
             json=payload,
-            headers=_hub_headers(config),
+            headers=hub_headers(config),
             timeout=10,
         )
         if resp.ok:
@@ -165,14 +165,20 @@ def hub_post(config, method, payload):
         return False, str(e)[:300]
 
 
-def _hub_headers(config):
+def hub_headers(config):
     secret = ""
     try:
         secret = config.get_password("webhook_secret", raise_exception=False) or ""
     except Exception:
         pass
-    return {
+    headers = {
         "X-SM-Secret": secret,
         "X-Vendor-ID": config.vendor_id,
         "Content-Type": "application/json",
     }
+    # hub_url is often a Docker service name (e.g. http://hub:8000), which
+    # is not itself a valid Frappe site — an explicit Host header is what
+    # routes the request to the right site on a multi-tenant hub bench.
+    if config.hub_site:
+        headers["Host"] = config.hub_site
+    return headers

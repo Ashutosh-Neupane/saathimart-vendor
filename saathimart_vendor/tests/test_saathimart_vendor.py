@@ -179,10 +179,13 @@ class TestProductMapping(unittest.TestCase):
         dupe = frappe.new_doc("Product Mapping")
         dupe.barcode = "8901234500001"
         dupe.item_code = "VT-ITEM-002B"
-        with self.assertRaises(frappe.DuplicateEntryError):
+        # a barcode unique-constraint violation, not a name/primary-key
+        # collision — those are DuplicateEntryError (a NameError subclass);
+        # this is UniqueValidationError (a ValidationError subclass).
+        with self.assertRaises(frappe.UniqueValidationError):
             dupe.insert(ignore_permissions=True)
 
-    @patch("saathimart_vendor.doctype.product_mapping.product_mapping.hub_get")
+    @patch("saathimart_vendor.saathimart_vendor.doctype.product_mapping.product_mapping.hub_get")
     def test_sync_with_hub_success(self, mock_hub_get):
         mock_hub_get.return_value = {"name": "SM-PROD-0001", "sku": "TOMATO-1KG"}
         mapping = _make_mapping("8901234500002", "VT-ITEM-003", sync_status="Unmapped")
@@ -192,7 +195,7 @@ class TestProductMapping(unittest.TestCase):
         self.assertEqual(mapping.sync_status, "Mapped")
         self.assertEqual(mapping.hub_sku, "TOMATO-1KG")
 
-    @patch("saathimart_vendor.doctype.product_mapping.product_mapping.hub_get")
+    @patch("saathimart_vendor.saathimart_vendor.doctype.product_mapping.product_mapping.hub_get")
     def test_sync_with_hub_not_found_raises_and_marks_error(self, mock_hub_get):
         mock_hub_get.return_value = None
         mapping = _make_mapping("8901234500003", "VT-ITEM-004", sync_status="Unmapped")
@@ -315,49 +318,64 @@ class TestStockHooks(unittest.TestCase):
         self.assertIsNotNone(row, f"no outbox row for voucher {voucher_no}")
         return row.event_type, json.loads(row.payload)
 
+    # hooks.py only registers on_stock_ledger_entry_submit/_cancel (against
+    # "Stock Ledger Entry", not per-voucher doctypes — see the module
+    # docstring in event_handlers/stock.py: SLE is the single source of
+    # truth for every stock movement). These tests drive that one hook with
+    # a fake SLE row per voucher type instead of calling per-voucher-type
+    # functions that no longer exist.
+
     def test_purchase_receipt_submit_enqueues_stock_receipt(self):
-        from saathimart_vendor.event_handlers.stock import on_purchase_receipt_submit
-        doc = _fake_doc(name="STOCK-TEST-PR-1", items=[
-            _fake_item_row(item_code="VT-ITEM-STOCK", qty=15),
-        ])
-        on_purchase_receipt_submit(doc, "on_submit")
+        from saathimart_vendor.event_handlers.stock import on_stock_ledger_entry_submit
+        doc = _fake_doc(
+            voucher_type="Purchase Receipt", voucher_no="STOCK-TEST-PR-1",
+            item_code="VT-ITEM-STOCK", actual_qty=15,
+        )
+        on_stock_ledger_entry_submit(doc, "on_submit")
         event_type, payload = self._last_outbox_payload("STOCK-TEST-PR-1")
         self.assertEqual(event_type, "stock.receipt")
         self.assertEqual(payload["qty_change"], 15)
         self.assertEqual(payload["barcode"], "8901234500010")
 
     def test_purchase_receipt_cancel_enqueues_stock_deduct(self):
-        from saathimart_vendor.event_handlers.stock import on_purchase_receipt_cancel
-        doc = _fake_doc(name="STOCK-TEST-PR-2", items=[
-            _fake_item_row(item_code="VT-ITEM-STOCK", qty=5),
-        ])
-        on_purchase_receipt_cancel(doc, "on_cancel")
-        event_type, payload = self._last_outbox_payload("CANCEL-STOCK-TEST-PR-2")
+        from saathimart_vendor.event_handlers.stock import on_stock_ledger_entry_cancel
+        doc = _fake_doc(
+            voucher_type="Purchase Receipt", voucher_no="STOCK-TEST-PR-2",
+            item_code="VT-ITEM-STOCK", actual_qty=5,
+        )
+        on_stock_ledger_entry_cancel(doc, "on_cancel")
+        # the outbox row's own voucher_no is doc.voucher_no unprefixed —
+        # only the payload's *internal* voucher_no (sent to the hub) gets
+        # the "CANCEL-" prefix, see on_stock_ledger_entry_cancel().
+        event_type, payload = self._last_outbox_payload("STOCK-TEST-PR-2")
         self.assertEqual(event_type, "stock.deduct")
         self.assertEqual(payload["qty_change"], -5)
+        self.assertEqual(payload["voucher_no"], "CANCEL-STOCK-TEST-PR-2")
 
     def test_purchase_receipt_unmapped_item_creates_no_outbox_row(self):
-        from saathimart_vendor.event_handlers.stock import on_purchase_receipt_submit
+        from saathimart_vendor.event_handlers.stock import on_stock_ledger_entry_submit
         _make_item("VT-ITEM-UNMAPPED")
-        doc = _fake_doc(name="STOCK-TEST-PR-3", items=[
-            _fake_item_row(item_code="VT-ITEM-UNMAPPED", qty=10),
-        ])
-        on_purchase_receipt_submit(doc, "on_submit")
+        doc = _fake_doc(
+            voucher_type="Purchase Receipt", voucher_no="STOCK-TEST-PR-3",
+            item_code="VT-ITEM-UNMAPPED", actual_qty=10,
+        )
+        on_stock_ledger_entry_submit(doc, "on_submit")
         count = frappe.db.count("Sync Outbox", {"voucher_no": "STOCK-TEST-PR-3"})
         self.assertEqual(count, 0)
 
     def test_sales_invoice_submit_enqueues_stock_deduct(self):
-        from saathimart_vendor.event_handlers.stock import on_sales_invoice_submit
-        doc = _fake_doc(name="STOCK-TEST-SI-1", items=[
-            _fake_item_row(item_code="VT-ITEM-STOCK", qty=3, sales_order=None),
-        ])
-        on_sales_invoice_submit(doc, "on_submit")
+        from saathimart_vendor.event_handlers.stock import on_stock_ledger_entry_submit
+        doc = _fake_doc(
+            voucher_type="Sales Invoice", voucher_no="STOCK-TEST-SI-1",
+            item_code="VT-ITEM-STOCK", actual_qty=-3, items=[],
+        )
+        on_stock_ledger_entry_submit(doc, "on_submit")
         event_type, payload = self._last_outbox_payload("STOCK-TEST-SI-1")
         self.assertEqual(event_type, "stock.deduct")
         self.assertEqual(payload["qty_change"], -3)
 
     def test_sales_invoice_skipped_for_saathimart_order(self):
-        from saathimart_vendor.event_handlers.stock import on_sales_invoice_submit
+        from saathimart_vendor.event_handlers.stock import on_stock_ledger_entry_submit
         so_name = "SO-SM-LINKED-001"
         if not frappe.db.exists("Vendor Order", "HUB-ORDER-LINKED-001"):
             vo = frappe.new_doc("Vendor Order")
@@ -368,41 +386,40 @@ class TestStockHooks(unittest.TestCase):
             vo.received_at = now_datetime()
             vo.insert(ignore_permissions=True)
 
-        doc = _fake_doc(name="STOCK-TEST-SI-2", voucher_type="Sales Invoice", items=[
-            _fake_item_row(item_code="VT-ITEM-STOCK", qty=2, sales_order=so_name),
-        ])
-        on_sales_invoice_submit(doc, "on_submit")
+        doc = _fake_doc(
+            voucher_type="Sales Invoice", voucher_no="STOCK-TEST-SI-2",
+            item_code="VT-ITEM-STOCK", actual_qty=-2,
+            items=[_fake_item_row(against_sales_order=so_name)],
+        )
+        on_stock_ledger_entry_submit(doc, "on_submit")
         count = frappe.db.count("Sync Outbox", {"voucher_no": "STOCK-TEST-SI-2"})
         self.assertEqual(count, 0)
 
     def test_stock_entry_material_receipt_increases_qty(self):
-        from saathimart_vendor.event_handlers.stock import on_stock_entry_submit
-        doc = _fake_doc(name="STOCK-TEST-SE-1", stock_entry_type="Material Receipt", items=[
-            _fake_item_row(item_code="VT-ITEM-STOCK", qty=8),
-        ])
-        on_stock_entry_submit(doc, "on_submit")
+        from saathimart_vendor.event_handlers.stock import on_stock_ledger_entry_submit
+        # voucher_detail_no set (truthy) means "this SLE came from a Stock
+        # Entry row" — actual_qty is trusted as already correctly signed,
+        # same as real ERPNext SLEs, instead of re-deriving direction from
+        # stock_entry_type.
+        doc = _fake_doc(
+            voucher_type="Stock Entry", voucher_no="STOCK-TEST-SE-1", voucher_detail_no="se-row-1",
+            item_code="VT-ITEM-STOCK", actual_qty=8,
+        )
+        on_stock_ledger_entry_submit(doc, "on_submit")
         event_type, payload = self._last_outbox_payload("STOCK-TEST-SE-1")
         self.assertEqual(event_type, "stock.receipt")
         self.assertEqual(payload["qty_change"], 8)
 
     def test_stock_entry_material_issue_decreases_qty(self):
-        from saathimart_vendor.event_handlers.stock import on_stock_entry_submit
-        doc = _fake_doc(name="STOCK-TEST-SE-2", stock_entry_type="Material Issue", items=[
-            _fake_item_row(item_code="VT-ITEM-STOCK", qty=4),
-        ])
-        on_stock_entry_submit(doc, "on_submit")
+        from saathimart_vendor.event_handlers.stock import on_stock_ledger_entry_submit
+        doc = _fake_doc(
+            voucher_type="Stock Entry", voucher_no="STOCK-TEST-SE-2", voucher_detail_no="se-row-2",
+            item_code="VT-ITEM-STOCK", actual_qty=-4,
+        )
+        on_stock_ledger_entry_submit(doc, "on_submit")
         event_type, payload = self._last_outbox_payload("STOCK-TEST-SE-2")
         self.assertEqual(event_type, "stock.deduct")
         self.assertEqual(payload["qty_change"], -4)
-
-    def test_stock_entry_repack_ignored_types_produce_no_row(self):
-        from saathimart_vendor.event_handlers.stock import on_stock_entry_submit
-        doc = _fake_doc(name="STOCK-TEST-SE-3", stock_entry_type="Send to Subcontractor", items=[
-            _fake_item_row(item_code="VT-ITEM-STOCK", qty=1),
-        ])
-        on_stock_entry_submit(doc, "on_submit")
-        count = frappe.db.count("Sync Outbox", {"voucher_no": "STOCK-TEST-SE-3"})
-        self.assertEqual(count, 0)
 
 
 # ── Test: Inbound webhook handlers (api/receive.py) ────────────────────────────
@@ -412,11 +429,6 @@ class TestReceiveFromHub(unittest.TestCase):
     def setUp(self):
         frappe.set_user("Administrator")
         _configure_vendor(vendor_id="vendor-test-receive")
-
-    def _clear_request_secret(self):
-        doc = frappe.get_single("Vendor Config")
-        doc.webhook_secret = ""
-        doc.save(ignore_permissions=True)
 
     def test_handle_new_order_creates_vendor_order(self):
         from saathimart_vendor.api.receive import _handle_new_order
@@ -482,15 +494,21 @@ class TestReceiveFromHub(unittest.TestCase):
         self.assertEqual(status, "Cancelled")
 
     def test_receive_from_hub_requires_event(self):
+        # _verify_hub_secret/_verify_timestamp both need a real HTTP request
+        # (frappe.request.headers) — bypassed here since these two tests are
+        # about event validation, not the auth layer (which has its own
+        # coverage via _verify_hub_secret's callers/AuthGuards tests).
         from saathimart_vendor.api.receive import receive_from_hub
-        self._clear_request_secret()
-        with self.assertRaises(frappe.ValidationError):
-            receive_from_hub(event=None, payload={})
+        with patch("saathimart_vendor.api.receive._verify_hub_secret"), \
+             patch("saathimart_vendor.api.receive._verify_timestamp"):
+            with self.assertRaises(frappe.ValidationError):
+                receive_from_hub(event=None, payload={})
 
     def test_receive_from_hub_unknown_event_does_not_raise(self):
         from saathimart_vendor.api.receive import receive_from_hub
-        self._clear_request_secret()
-        result = receive_from_hub(event="order.teleported", payload={})
+        with patch("saathimart_vendor.api.receive._verify_hub_secret"), \
+             patch("saathimart_vendor.api.receive._verify_timestamp"):
+            result = receive_from_hub(event="order.teleported", payload={})
         self.assertEqual(result, {"ok": True})
 
 
@@ -514,7 +532,7 @@ class TestVendorOrderLifecycle(unittest.TestCase):
         doc.grand_total = 500
         doc.received_at = now_datetime()
         for it in (items if items is not None else [
-            {"product": self.mapping.hub_product_id, "qty": 2, "rate": 100},
+            {"product": self.mapping.hub_product_id, "item_code": self.mapping.item_code, "qty": 2, "rate": 100},
         ]):
             doc.append("items", {
                 "product": it.get("product", ""),
@@ -543,16 +561,22 @@ class TestVendorOrderLifecycle(unittest.TestCase):
             vo.accept_order()
 
     def test_accept_order_missing_mapping_raises(self):
+        # item_code must be a real ERPNext Item (Vendor Order Item.item_code
+        # is a mandatory Link) — "product" is the hub_product_id that
+        # accept_order() looks up in Product Mapping, and deliberately has
+        # no matching mapping here.
         vo = self._make_received_order("HUB-ORDER-ACCEPT-003", items=[
-            {"product": "SM-PROD-NOT-MAPPED", "qty": 1, "rate": 50},
+            {"product": "SM-PROD-NOT-MAPPED", "item_code": self.mapping.item_code, "qty": 1, "rate": 50},
         ])
         with self.assertRaises(frappe.ValidationError):
             vo.accept_order()
 
     def test_accept_order_empty_items_raises(self):
-        vo = self._make_received_order("HUB-ORDER-ACCEPT-004", items=[])
+        # Vendor Order.items is a mandatory child table (reqd=1), so an
+        # empty items list is rejected at insert() itself — accept_order()
+        # is never reached with such a document.
         with self.assertRaises(frappe.ValidationError):
-            vo.accept_order()
+            self._make_received_order("HUB-ORDER-ACCEPT-004", items=[])
 
     def test_mark_dispatched_enqueues_event_and_sets_timestamp(self):
         vo = self._make_received_order("HUB-ORDER-DISPATCH-001")

@@ -2,7 +2,7 @@ import json
 import frappe
 import requests
 from frappe.utils import now_datetime, add_to_date, nowdate, get_url
-from saathimart_vendor.utils import get_config, enqueue_outbox
+from saathimart_vendor.utils import get_config, enqueue_outbox, hub_headers
 
 
 # ── Outbox flush (every 1 min) ────────────────────────────────────────────────
@@ -26,12 +26,6 @@ def flush_outbox():
 
 
 def _push_to_hub(config, row):
-    secret = ""
-    try:
-        secret = config.get_password("webhook_secret", raise_exception=False) or ""
-    except Exception:
-        pass
-
     try:
         resp = requests.post(
             f"{config.hub_url}/api/method/saathimart.api.events.receive",
@@ -39,11 +33,7 @@ def _push_to_hub(config, row):
                 "event":   row.event_type,
                 "payload": json.loads(row.payload or "{}"),
             },
-            headers={
-                "X-SM-Secret":  secret,
-                "X-Vendor-ID":  config.vendor_id,
-                "Content-Type": "application/json",
-            },
+            headers=hub_headers(config),
             timeout=10,
         )
         if resp.ok:
@@ -98,7 +88,7 @@ def check_hub_health():
         return
 
     try:
-        resp = requests.get(f"{config.hub_url}/api/method/ping", timeout=5)
+        resp = requests.get(f"{config.hub_url}/api/method/ping", headers=hub_headers(config), timeout=5)
         status = "Active" if resp.ok else "Unreachable"
     except Exception:
         status = "Unreachable"
@@ -156,12 +146,6 @@ def _reconcile_chunk(config_name, mappings):
     if not config or not config.reconciliation_enabled:
         return
 
-    secret = ""
-    try:
-        secret = config.get_password("webhook_secret", raise_exception=False) or ""
-    except Exception:
-        pass
-
     products = [m.hub_product_id for m in mappings if m.hub_product_id]
     batch_result = {}
     if products:
@@ -169,7 +153,7 @@ def _reconcile_chunk(config_name, mappings):
             resp = requests.get(
                 f"{config.hub_url}/api/method/saathimart.api.stock.get_vendor_stock_batch",
                 params={"vendor": config.vendor_id, "products": ",".join(products)},
-                headers={"X-SM-Secret": secret, "X-Vendor-ID": config.vendor_id},
+                headers=hub_headers(config),
                 timeout=30,
             )
             if resp.ok:
@@ -203,17 +187,11 @@ def _reconcile_item(config, mapping, batch_result=None):
     if batch_result and hub_product and hub_product in batch_result:
         hub_physical = float(batch_result[hub_product].get("physical_qty", 0) or 0)
     elif hub_product:
-        secret = ""
-        try:
-            secret = config.get_password("webhook_secret", raise_exception=False) or ""
-        except Exception:
-            pass
-
         try:
             resp = requests.get(
                 f"{config.hub_url}/api/method/saathimart.api.stock.get_vendor_stock",
                 params={"vendor": config.vendor_id, "product": hub_product},
-                headers={"X-SM-Secret": secret, "X-Vendor-ID": config.vendor_id},
+                headers=hub_headers(config),
                 timeout=10,
             )
             if resp.ok:
