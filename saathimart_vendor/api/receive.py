@@ -91,10 +91,9 @@ def _handle_order_cancel(payload):
         return
 
     doc = frappe.get_doc("Vendor Order", hub_order_id)
-    _validate_transition(doc.status, "Cancelled")
-
     if doc.status in ("Delivered", "Cancelled"):
         return
+    _validate_transition(doc.status, "Cancelled")
 
     if doc.sales_order:
         so = frappe.get_doc("Sales Order", doc.sales_order)

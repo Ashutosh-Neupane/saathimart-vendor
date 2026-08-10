@@ -60,7 +60,11 @@ def generate_event_id():
 
 VALID_TRANSITIONS = {
     "Received":    ["Accepted", "Cancelled"],
-    "Accepted":    ["Preparing", "Cancelled"],
+    # "Preparing" is an optional intermediate status — mark_dispatched()'s
+    # own guard (`status not in ("Accepted", "Preparing")`) already allows
+    # dispatching straight from "Accepted" for vendors who fulfill
+    # instantly, so this map must allow it too or that guard is dead code.
+    "Accepted":    ["Preparing", "Dispatched", "Cancelled"],
     "Preparing":   ["Dispatched", "Cancelled"],
     "Dispatched":  ["Delivered"],
     "Delivered":   [],

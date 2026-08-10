@@ -22,6 +22,8 @@ class VendorOrder(Document):
     def accept_order(self):
         if self.status != "Received":
             frappe.throw(_(f"Cannot accept order in status: {self.status}"))
+        if self.payment_method == "eSewa" and self.payment_status != "Paid":
+            frappe.throw(_("Cannot accept eSewa order until payment is confirmed."))
         config = get_config()
         if not config:
             frappe.throw(_("Vendor Config not configured"))
@@ -48,6 +50,11 @@ class VendorOrder(Document):
                 "rate": item.rate,
                 "warehouse": config.default_warehouse,
             })
+        # Price List / currency / exchange rate aren't set anywhere above —
+        # normally the desk UI's client script fills these in as items are
+        # added; built server-side like this, they're left blank and
+        # insert() fails on mandatory fields without this.
+        so.set_missing_values()
         so.insert(ignore_permissions=True)
         so.submit()
 
@@ -116,6 +123,13 @@ class VendorOrder(Document):
             so = frappe.get_doc("Sales Order", self.sales_order)
             if so.docstatus == 1:
                 so.cancel()
+                # so.cancel() fires event_handlers.orders.on_sales_order_cancel,
+                # which writes this same Vendor Order's status directly via
+                # frappe.db.set_value() (needed for Sales Orders cancelled
+                # outside this method too) — bumping `modified` underneath
+                # this in-memory doc. Reload before continuing, or the
+                # save() below hits a TimestampMismatchError.
+                self.reload()
         self.status = "Cancelled"
         self.notes = f"Cancelled by vendor: {reason}" if reason else "Cancelled by vendor"
         self.save(ignore_permissions=True)
@@ -132,6 +146,11 @@ class VendorOrder(Document):
         )
 
 
+def _first_leaf(doctype):
+    """First non-group record of doctype, or None if only the root exists."""
+    return frappe.db.get_value(doctype, {"is_group": 0}, "name")
+
+
 def _get_or_create_customer(name, phone):
     existing = frappe.db.get_value("Customer", {"customer_name": name}, "name")
     if existing:
@@ -139,9 +158,15 @@ def _get_or_create_customer(name, phone):
     cust = frappe.new_doc("Customer")
     cust.customer_name = name
     cust.customer_type = "Individual"
-    cust.customer_group = (frappe.db.get_single_value(
-        "Selling Settings", "customer_group") or "All Customer Groups")
-    cust.territory = (frappe.db.get_single_value(
-        "Selling Settings", "territory") or "All Territories")
+    # Selling Settings' customer_group/territory are blank on a site where
+    # nobody has been through Selling Settings manually (any fresh vendor
+    # site) — "All Customer Groups"/"All Territories" are group/root nodes,
+    # and ERPNext rejects a non-group Customer being filed under one, so
+    # falling back to those would fail every single time. Fall back to a
+    # real leaf node instead.
+    cust.customer_group = (frappe.db.get_single_value("Selling Settings", "customer_group")
+        or _first_leaf("Customer Group") or "Individual")
+    cust.territory = (frappe.db.get_single_value("Selling Settings", "territory")
+        or _first_leaf("Territory") or "Nepal")
     cust.insert(ignore_permissions=True)
     return cust.name

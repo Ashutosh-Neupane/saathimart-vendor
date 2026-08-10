@@ -26,12 +26,53 @@ import unittest
 from unittest.mock import patch, MagicMock
 
 import frappe
-from frappe.utils import flt, now_datetime
+from frappe.utils import flt, now_datetime, today, getdate
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _ensure_fiscal_year():
+    """Sales Order.submit() requires an active Fiscal Year covering today —
+    unlike the standard warehouses, ERPNext's Company.insert() doesn't
+    create one on its own."""
+    year = getdate(today()).year
+    if frappe.db.exists("Fiscal Year", {
+        "year_start_date": ["<=", today()], "year_end_date": [">=", today()],
+    }):
+        return
+    fy = frappe.new_doc("Fiscal Year")
+    fy.year = str(year)
+    fy.year_start_date = f"{year}-01-01"
+    fy.year_end_date = f"{year}-12-31"
+    fy.insert(ignore_permissions=True)
+    frappe.db.commit()
+
+
+def _ensure_base_fixtures():
+    """Warehouse Type: Transit (needed by Company.on_update's
+    create_default_warehouses()) and a Standard Selling Price List (needed
+    by Sales Order.set_missing_values()) — nothing on a fresh test site
+    creates these except the Setup Wizard, which never runs here.
+    erpnext.setup.setup_wizard.operations.install_fixtures.install() would
+    normally provide both (plus Item Groups, Stock Entry Types, etc.), but
+    it hits a NestedSetRecursionError on its Sales Person fixture on this
+    ERPNext version — create just the two records actually needed instead
+    of pulling in that whole (currently broken) installer.
+    """
+    if not frappe.db.exists("Warehouse Type", "Transit"):
+        frappe.get_doc({"doctype": "Warehouse Type", "name": "Transit"}).insert(ignore_permissions=True)
+    for pl_name, buying, selling in [("Standard Buying", 1, 0), ("Standard Selling", 0, 1)]:
+        if not frappe.db.exists("Price List", pl_name):
+            frappe.get_doc({
+                "doctype": "Price List", "price_list_name": pl_name, "enabled": 1,
+                "buying": buying, "selling": selling, "currency": "NPR",
+            }).insert(ignore_permissions=True)
+    frappe.db.commit()
+
+
 def _ensure_company(name="Vendor Test Co", abbr="VTC"):
+    _ensure_fiscal_year()
+    _ensure_base_fixtures()
     if frappe.db.exists("Company", name):
         return name
     doc = frappe.new_doc("Company")
@@ -143,10 +184,12 @@ class TestVendorConfig(unittest.TestCase):
 
     def test_get_config_returns_none_when_incomplete(self):
         from saathimart_vendor.utils import get_config
-        doc = frappe.get_single("Vendor Config")
-        doc.hub_url = ""
-        doc.vendor_id = ""
-        doc.db_update()
+        # Vendor Config is a Single — it lives in tabSingles, not a
+        # tabVendor Config table, so doc.db_update() (which blindly issues
+        # `UPDATE tab<doctype>`) fails; frappe.db.set_value() knows how to
+        # write Singles correctly while still bypassing doc-level validation
+        # (needed here since vendor_id="" would normally fail .save()).
+        frappe.db.set_value("Vendor Config", "Vendor Config", {"hub_url": "", "vendor_id": ""})
         frappe.db.commit()
         self.assertIsNone(get_config())
 
@@ -380,11 +423,15 @@ class TestStockHooks(unittest.TestCase):
         if not frappe.db.exists("Vendor Order", "HUB-ORDER-LINKED-001"):
             vo = frappe.new_doc("Vendor Order")
             vo.hub_order_id = "HUB-ORDER-LINKED-001"
-            vo.sales_order = so_name
             vo.customer_name = "Test Customer"
-            vo.items = []
+            vo.append("items", {"product": "SM-PROD-LINKED", "qty": 1, "rate": 100})
             vo.received_at = now_datetime()
             vo.insert(ignore_permissions=True)
+            # sales_order is a mandatory-on-real-use Link to Sales Order —
+            # _is_saathimart_order_from_si only needs a Vendor Order row
+            # whose sales_order matches so_name for its exists() check, not
+            # a real Sales Order, so write it directly past Link validation.
+            frappe.db.set_value("Vendor Order", vo.name, "sales_order", so_name)
 
         doc = _fake_doc(
             voucher_type="Sales Invoice", voucher_no="STOCK-TEST-SI-2",
@@ -433,6 +480,11 @@ class TestReceiveFromHub(unittest.TestCase):
     def test_handle_new_order_creates_vendor_order(self):
         from saathimart_vendor.api.receive import _handle_new_order
         hub_order_id = "HUB-ORDER-NEW-001"
+        # frappe.db.delete() is a raw table-only delete — it does not
+        # cascade to the Vendor Order Item child table, so leftover rows
+        # from an earlier run would silently inflate len(doc.items) on
+        # a document re-created with the same name (== hub_order_id).
+        frappe.db.delete("Vendor Order Item", {"parent": hub_order_id})
         frappe.db.delete("Vendor Order", {"hub_order_id": hub_order_id})
         frappe.db.commit()
 
@@ -454,9 +506,14 @@ class TestReceiveFromHub(unittest.TestCase):
     def test_handle_new_order_idempotent_on_duplicate(self):
         from saathimart_vendor.api.receive import _handle_new_order
         hub_order_id = "HUB-ORDER-DUPE-001"
+        # frappe.db.delete() is a raw table-only delete — it does not
+        # cascade to the Vendor Order Item child table, so leftover rows
+        # from an earlier run would silently inflate len(doc.items) on
+        # a document re-created with the same name (== hub_order_id).
+        frappe.db.delete("Vendor Order Item", {"parent": hub_order_id})
         frappe.db.delete("Vendor Order", {"hub_order_id": hub_order_id})
         frappe.db.commit()
-        payload = {"order_id": hub_order_id, "customer_name": "A", "grand_total": 100, "items": []}
+        payload = {"order_id": hub_order_id, "customer_name": "A", "grand_total": 100, "items": [{"product": "SM-PROD-DUMMY", "qty": 1, "rate": 100}]}
         _handle_new_order(payload)
         _handle_new_order(payload)  # second push for same order must not error/duplicate
         count = frappe.db.count("Vendor Order", {"hub_order_id": hub_order_id})
@@ -465,9 +522,14 @@ class TestReceiveFromHub(unittest.TestCase):
     def test_handle_order_cancel_updates_status(self):
         from saathimart_vendor.api.receive import _handle_new_order, _handle_order_cancel
         hub_order_id = "HUB-ORDER-CANCEL-001"
+        # frappe.db.delete() is a raw table-only delete — it does not
+        # cascade to the Vendor Order Item child table, so leftover rows
+        # from an earlier run would silently inflate len(doc.items) on
+        # a document re-created with the same name (== hub_order_id).
+        frappe.db.delete("Vendor Order Item", {"parent": hub_order_id})
         frappe.db.delete("Vendor Order", {"hub_order_id": hub_order_id})
         frappe.db.commit()
-        _handle_new_order({"order_id": hub_order_id, "customer_name": "A", "grand_total": 100, "items": []})
+        _handle_new_order({"order_id": hub_order_id, "customer_name": "A", "grand_total": 100, "items": [{"product": "SM-PROD-DUMMY", "qty": 1, "rate": 100}]})
         _handle_order_cancel({"order_id": hub_order_id, "reason": "Customer changed mind"})
         status = frappe.db.get_value("Vendor Order", hub_order_id, "status")
         self.assertEqual(status, "Cancelled")
@@ -475,9 +537,14 @@ class TestReceiveFromHub(unittest.TestCase):
     def test_handle_order_cancel_skips_already_delivered(self):
         from saathimart_vendor.api.receive import _handle_new_order, _handle_order_cancel
         hub_order_id = "HUB-ORDER-DELIVERED-001"
+        # frappe.db.delete() is a raw table-only delete — it does not
+        # cascade to the Vendor Order Item child table, so leftover rows
+        # from an earlier run would silently inflate len(doc.items) on
+        # a document re-created with the same name (== hub_order_id).
+        frappe.db.delete("Vendor Order Item", {"parent": hub_order_id})
         frappe.db.delete("Vendor Order", {"hub_order_id": hub_order_id})
         frappe.db.commit()
-        _handle_new_order({"order_id": hub_order_id, "customer_name": "A", "grand_total": 100, "items": []})
+        _handle_new_order({"order_id": hub_order_id, "customer_name": "A", "grand_total": 100, "items": [{"product": "SM-PROD-DUMMY", "qty": 1, "rate": 100}]})
         frappe.db.set_value("Vendor Order", hub_order_id, "status", "Delivered")
         _handle_order_cancel({"order_id": hub_order_id, "reason": "too late"})
         status = frappe.db.get_value("Vendor Order", hub_order_id, "status")
@@ -486,9 +553,14 @@ class TestReceiveFromHub(unittest.TestCase):
     def test_handle_order_reassign_marks_cancelled(self):
         from saathimart_vendor.api.receive import _handle_new_order, _handle_order_reassign
         hub_order_id = "HUB-ORDER-REASSIGN-001"
+        # frappe.db.delete() is a raw table-only delete — it does not
+        # cascade to the Vendor Order Item child table, so leftover rows
+        # from an earlier run would silently inflate len(doc.items) on
+        # a document re-created with the same name (== hub_order_id).
+        frappe.db.delete("Vendor Order Item", {"parent": hub_order_id})
         frappe.db.delete("Vendor Order", {"hub_order_id": hub_order_id})
         frappe.db.commit()
-        _handle_new_order({"order_id": hub_order_id, "customer_name": "A", "grand_total": 100, "items": []})
+        _handle_new_order({"order_id": hub_order_id, "customer_name": "A", "grand_total": 100, "items": [{"product": "SM-PROD-DUMMY", "qty": 1, "rate": 100}]})
         _handle_order_reassign({"order_id": hub_order_id, "reason": "vendor out of stock"})
         status = frappe.db.get_value("Vendor Order", hub_order_id, "status")
         self.assertEqual(status, "Cancelled")
@@ -522,6 +594,11 @@ class TestVendorOrderLifecycle(unittest.TestCase):
         self.mapping = _make_mapping("8901234500020", "VT-ITEM-ORDER")
 
     def _make_received_order(self, hub_order_id, items=None):
+        # frappe.db.delete() is a raw table-only delete — it does not
+        # cascade to the Vendor Order Item child table, so leftover rows
+        # from an earlier run would silently inflate len(doc.items) on
+        # a document re-created with the same name (== hub_order_id).
+        frappe.db.delete("Vendor Order Item", {"parent": hub_order_id})
         frappe.db.delete("Vendor Order", {"hub_order_id": hub_order_id})
         frappe.db.commit()
         doc = frappe.new_doc("Vendor Order")
@@ -731,8 +808,14 @@ class TestTasks(unittest.TestCase):
         self.assertEqual(status, "Unreachable")
 
     @patch("saathimart_vendor.tasks._reconcile_item")
-    def test_reconcile_stock_visits_every_active_mapping(self, mock_reconcile_item):
-        from saathimart_vendor.tasks import reconcile_stock
+    @patch("saathimart_vendor.tasks.frappe.enqueue")
+    def test_reconcile_stock_visits_every_active_mapping(self, mock_enqueue, mock_reconcile_item):
+        from saathimart_vendor.tasks import reconcile_stock, _reconcile_chunk
+        # reconcile_stock() hands chunks off to frappe.enqueue() for a
+        # background worker to process — no worker runs during
+        # `bench run-tests`, so run the chunk inline instead, same as a
+        # worker eventually would.
+        mock_enqueue.side_effect = lambda *a, **kw: _reconcile_chunk(kw["config_name"], kw["mappings"])
         _make_mapping("8901234500080", "VT-ITEM-RECON-1")
         _make_mapping("8901234500081", "VT-ITEM-RECON-2")
         reconcile_stock()

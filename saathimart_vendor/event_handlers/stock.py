@@ -114,7 +114,17 @@ def on_stock_ledger_entry_cancel(doc, method):
     # Reverse the qty_change
     qty_change = -doc.actual_qty
 
-    event_type = _get_voucher_event_type(doc.voucher_type, qty_change)
+    # _get_voucher_event_type's VOUCHER_TYPE_MAP encodes the *forward*
+    # (submit) direction only — a cancelled Purchase Receipt would still
+    # look up "stock.receipt" there even though the negated qty_change
+    # means it's actually a deduction now. Derive purely from the
+    # (already-reversed) sign instead of the fixed per-type mapping.
+    if qty_change > 0:
+        event_type = "stock.receipt"
+    elif qty_change < 0:
+        event_type = "stock.deduct"
+    else:
+        event_type = "stock.adjustment"
     base_qty = _get_base_qty(doc.item_code)
 
     payload = build_stock_payload(

@@ -166,13 +166,23 @@ if existing_warehouse:
 else:
     # Nothing exists yet (fresh demo site: no Setup Wizard has ever run
     # here, so there's no Company/Warehouse to point at at all). Bootstrap
-    # the same base fixtures the wizard would have installed — Company.
-    # on_update's create_default_warehouses() needs "Warehouse Type:
-    # Transit" to exist — then a demo Company so a real warehouse exists.
-    from erpnext.setup.setup_wizard.operations.install_fixtures import install as install_erpnext_fixtures
+    # the two base fixtures actually needed — Company.on_update's
+    # create_default_warehouses() needs "Warehouse Type: Transit", and
+    # accept_order()'s Sales Order needs a Price List ("Standard Selling").
+    # erpnext.setup.setup_wizard.operations.install_fixtures.install()
+    # would normally provide both (it's what the Setup Wizard calls), but
+    # it hits a NestedSetRecursionError on its Sales Person fixture on this
+    # ERPNext version — create just what's needed instead of pulling in
+    # that whole (currently broken) installer.
     if not frappe.db.exists('Warehouse Type', 'Transit'):
-        install_erpnext_fixtures(country='Nepal')
-        frappe.db.commit()
+        frappe.get_doc({'doctype': 'Warehouse Type', 'name': 'Transit'}).insert(ignore_permissions=True)
+    for pl_name, buying, selling in [('Standard Buying', 1, 0), ('Standard Selling', 0, 1)]:
+        if not frappe.db.exists('Price List', pl_name):
+            frappe.get_doc({
+                'doctype': 'Price List', 'price_list_name': pl_name, 'enabled': 1,
+                'buying': buying, 'selling': selling, 'currency': 'NPR',
+            }).insert(ignore_permissions=True)
+    frappe.db.commit()
 
     company_name = 'SaathiMart Vendor'
     abbr = 'SM'
@@ -183,6 +193,22 @@ else:
             'abbr': abbr,
             'default_currency': 'NPR',
             'country': 'Nepal',
+        }).insert(ignore_permissions=True)
+        frappe.db.commit()
+
+    # accept_order() submits a Sales Order, which requires an active Fiscal
+    # Year covering today — Company.insert() doesn't create one on its own,
+    # unlike the standard warehouses.
+    import datetime
+    year = datetime.date.today().year
+    if not frappe.db.exists('Fiscal Year', {
+        'year_start_date': ['<=', frappe.utils.today()], 'year_end_date': ['>=', frappe.utils.today()],
+    }):
+        frappe.get_doc({
+            'doctype': 'Fiscal Year',
+            'year': str(year),
+            'year_start_date': f'{year}-01-01',
+            'year_end_date': f'{year}-12-31',
         }).insert(ignore_permissions=True)
         frappe.db.commit()
 
