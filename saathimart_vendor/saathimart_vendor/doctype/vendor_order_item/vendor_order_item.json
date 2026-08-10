@@ -1,0 +1,18 @@
+{
+  "name": "Vendor Order Item",
+  "module": "Saathimart Vendor",
+  "doctype": "DocType",
+  "istable": 1,
+  "fields": [
+   {"fieldname": "product", "fieldtype": "Data", "label": "Hub Product ID", "reqd": 1},
+   {"fieldname": "item_code", "fieldtype": "Link", "label": "ERPNext Item", "options": "Item", "reqd": 1},
+   {"fieldname": "col_break_1", "fieldtype": "Column Break"},
+   {"fieldname": "qty", "fieldtype": "Float", "label": "Qty", "reqd": 1, "default": "1"},
+   {"fieldname": "rate", "fieldtype": "Currency", "label": "Rate", "reqd": 1, "default": "0"},
+   {"fieldname": "amount", "fieldtype": "Currency", "label": "Amount", "read_only": 1}
+  ],
+  "permissions": [
+   {"role": "System Manager", "read": 1, "write": 1},
+   {"role": "Sales User", "read": 1, "write": 1}
+  ]
+}

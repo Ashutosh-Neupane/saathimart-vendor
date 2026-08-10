@@ -1,0 +1,33 @@
+{
+ "name": "Sync Outbox",
+ "module": "Saathimart Vendor",
+ "doctype": "DocType",
+ "autoname": "OUT-.YYYY.-.#####",
+ "track_changes": 0,
+ "fields": [
+  {"fieldname": "event_type", "fieldtype": "Select", "label": "Event Type",
+   "options": "stock.receipt\nstock.deduct\nstock.adjustment\nprice.update\norder.confirmed\norder.dispatched\norder.delivered\norder.cancel",
+   "reqd": 1, "in_list_view": 1},
+  {"fieldname": "status", "fieldtype": "Select", "label": "Status",
+   "options": "Pending\nSent\nFailed\nDead",
+   "default": "Pending", "in_list_view": 1},
+  {"fieldname": "col_break_1", "fieldtype": "Column Break"},
+  {"fieldname": "voucher_type", "fieldtype": "Data", "label": "Voucher Type",
+   "in_list_view": 1},
+  {"fieldname": "voucher_no", "fieldtype": "Data", "label": "Voucher No",
+   "in_list_view": 1},
+  {"fieldname": "retry_count", "fieldtype": "Int", "label": "Retry Count",
+   "default": "0"},
+  {"fieldname": "next_retry_at", "fieldtype": "Datetime", "label": "Next Retry At"},
+  {"fieldname": "section_payload", "fieldtype": "Section Break", "label": "Payload"},
+  {"fieldname": "payload", "fieldtype": "Code", "label": "Payload (JSON)",
+   "options": "JSON", "reqd": 1},
+  {"fieldname": "last_error", "fieldtype": "Small Text", "label": "Last Error",
+   "read_only": 1}
+ ],
+ "title_field": "event_type",
+ "search_fields": "event_type,voucher_no,status",
+ "permissions": [
+  {"role": "System Manager", "read": 1, "write": 1, "create": 1, "delete": 0}
+ ]
+}
