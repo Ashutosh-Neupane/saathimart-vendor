@@ -4,8 +4,8 @@ import json
 
 import frappe
 from frappe import _
-from frappe.utils import now_datetime
-from saathimart_vendor.utils import get_config, VALID_TRANSITIONS
+from frappe.utils import flt, now_datetime
+from saathimart_vendor.utils import get_config, VALID_TRANSITIONS, hub_get, hub_post
 
 
 def _validate_transition(old_status, new_status):
@@ -56,6 +56,9 @@ def _handle_new_order(payload):
     if frappe.db.exists("Vendor Order", hub_order_id):
         return
 
+    config = get_config()
+    unmapped_notes = []
+
     doc = frappe.new_doc("Vendor Order")
     doc.hub_order_id     = hub_order_id
     doc.status           = "Received"
@@ -70,14 +73,82 @@ def _handle_new_order(payload):
     doc.received_at      = frappe.utils.now_datetime()
 
     for item in (payload.get("items") or []):
+        product_id  = item.get("product", "")
+        qty         = item.get("qty", 1)
+        rate        = item.get("rate", 0)
+        item_code   = ""
+
+        if product_id and config:
+            mapping = frappe.db.get_value(
+                "Product Mapping",
+                {"hub_product_id": product_id, "vendor": config.vendor_id, "sync_status": "Mapped"},
+                ["item_code", "barcode"],
+                as_dict=True,
+            )
+            if mapping:
+                item_code = mapping.item_code or ""
+            else:
+                hub_result = hub_get(config, "saathimart.api.products.lookup_by_barcode",
+                                     {"barcode": product_id})
+                if hub_result and hub_result.get("sku"):
+                    existing = frappe.db.get_value(
+                        "Product Mapping",
+                        {"barcode": hub_result["sku"], "vendor": config.vendor_id},
+                        ["name", "item_code"],
+                        as_dict=True,
+                    )
+                    if existing:
+                        frappe.db.set_value("Product Mapping", existing.name, {
+                            "hub_product_id": product_id,
+                            "sync_status":    "Mapped",
+                            "sync_error":     "",
+                            "last_synced":    frappe.utils.now_datetime(),
+                        })
+                        item_code = existing.item_code or ""
+                    else:
+                        pm = frappe.new_doc("Product Mapping")
+                        pm.barcode         = hub_result["sku"]
+                        pm.item_code       = ""
+                        pm.vendor          = config.vendor_id
+                        pm.hub_product_id  = product_id
+                        pm.hub_sku         = hub_result.get("sku", "")
+                        pm.sync_status     = "Unmapped"
+                        pm.insert(ignore_permissions=True)
+                        unmapped_notes.append(
+                            f"Auto-created mapping for {product_id} (barcode: {hub_result['sku']}) — item not assigned"
+                        )
+                else:
+                    unmapped_notes.append(f"Product {product_id} not found on hub for auto-mapping")
+
+        if item_code and qty > 0 and config and config.default_warehouse:
+            actual_qty = frappe.db.get_value(
+                "Bin", {"item_code": item_code, "warehouse": config.default_warehouse}, "actual_qty"
+            ) or 0
+            if flt(actual_qty) < flt(qty):
+                reason = f"Insufficient stock for {item_code}: has {actual_qty}, needs {qty}"
+                hub_post(config, "saathimart.api.events.receive", {
+                    "event": "order.cancel",
+                    "payload": {
+                        "order_id": hub_order_id,
+                        "vendor_id": config.vendor_id,
+                        "reason": reason,
+                    },
+                })
+                frappe.log_error(f"Rejected order {hub_order_id}: {reason}", "Vendor Stock Shortage")
+                return
+
         doc.append("items", {
-            "product":  item.get("product", ""),
-            "item_code": item.get("item_code", ""),
-            "qty":      item.get("qty", 1),
-            "rate":     item.get("rate", 0),
+            "product":   product_id,
+            "item_code": item_code,
+            "qty":       qty,
+            "rate":      rate,
         })
 
     doc.insert(ignore_permissions=True)
+
+    if unmapped_notes:
+        doc.notes = "\n".join(unmapped_notes)
+        doc.save(ignore_permissions=True)
 
     frappe.publish_realtime(
         "new_saathimart_order",

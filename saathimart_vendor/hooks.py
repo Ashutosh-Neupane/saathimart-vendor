@@ -26,6 +26,10 @@ doc_events = {
         "on_submit": "saathimart_vendor.event_handlers.orders.on_delivery_note_submit",
         "on_cancel":  "saathimart_vendor.event_handlers.orders.on_delivery_note_cancel",
     },
+    "Item Price": {
+        "after_insert": "saathimart_vendor.event_handlers.pricing.on_item_price_change",
+        "on_update":    "saathimart_vendor.event_handlers.pricing.on_item_price_change",
+    },
 }
 
 # ── Scheduled tasks ───────────────────────────────────────────────────

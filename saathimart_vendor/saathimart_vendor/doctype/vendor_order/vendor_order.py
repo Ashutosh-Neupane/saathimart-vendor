@@ -56,7 +56,16 @@ class VendorOrder(Document):
         # insert() fails on mandatory fields without this.
         so.set_missing_values()
         so.insert(ignore_permissions=True)
-        so.submit()
+        # Suppress event_handlers.orders.on_sales_order_submit for this
+        # submit — this method enqueues its own order.confirmed below, and
+        # without the flag both would fire in flows where self.sales_order
+        # is already persisted (e.g. retrying accept after a prior failed
+        # save left the link in place).
+        frappe.flags.in_vendor_order_accept = True
+        try:
+            so.submit()
+        finally:
+            frappe.flags.in_vendor_order_accept = False
 
         self.sales_order = so.name
         self.status = "Accepted"
@@ -122,13 +131,20 @@ class VendorOrder(Document):
         if self.sales_order:
             so = frappe.get_doc("Sales Order", self.sales_order)
             if so.docstatus == 1:
-                so.cancel()
                 # so.cancel() fires event_handlers.orders.on_sales_order_cancel,
-                # which writes this same Vendor Order's status directly via
-                # frappe.db.set_value() (needed for Sales Orders cancelled
-                # outside this method too) — bumping `modified` underneath
-                # this in-memory doc. Reload before continuing, or the
-                # save() below hits a TimestampMismatchError.
+                # which (for Sales Orders cancelled outside this method, e.g.
+                # directly via Desk) sets this Vendor Order's status and
+                # enqueues order.cancel itself. This method already does both
+                # below — with the vendor-supplied `reason` the hook doesn't
+                # have — so the flag makes the hook skip entirely and avoid a
+                # duplicate event / redundant write.
+                frappe.flags.in_vendor_order_cancel = True
+                try:
+                    so.cancel()
+                finally:
+                    frappe.flags.in_vendor_order_cancel = False
+                # Reload in case anything else touched this doc while
+                # so.cancel()'s own hooks/notifications ran.
                 self.reload()
         self.status = "Cancelled"
         self.notes = f"Cancelled by vendor: {reason}" if reason else "Cancelled by vendor"

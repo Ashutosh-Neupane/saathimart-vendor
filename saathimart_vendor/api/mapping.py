@@ -23,11 +23,13 @@ def lookup_barcode(barcode):
 def sync_vendor_stock():
     """
     Push the vendor's current stock for all mapped products to the hub.
-    Called by the vendor's warehouse staff after stock-taking or receiving.
+    Also auto-maps any unmapped items by barcode lookup before syncing.
     """
     config = get_config()
     if not config:
         frappe.throw(_("Vendor Config not configured"))
+
+    _auto_map_unmapped(config)
 
     mappings = frappe.get_list(
         "Product Mapping",
@@ -74,6 +76,28 @@ def sync_vendor_stock():
 
     frappe.db.commit()
     return {"pushed": pushed, "errors": errors}
+
+
+def _auto_map_unmapped(config):
+    """Try to auto-map any Unmapped/Error Product Mapping rows by re-checking hub."""
+    unmapped = frappe.get_list(
+        "Product Mapping",
+        filters={"sync_status": ["in", ["Unmapped", "Error"]], "is_active": 1, "vendor": config.vendor_id},
+        fields=["name", "barcode", "item_code"],
+    )
+    for row in unmapped:
+        result = hub_get(config, "saathimart.api.products.lookup_by_barcode",
+                         {"barcode": row.barcode})
+        if result:
+            frappe.db.set_value("Product Mapping", row.name, {
+                "hub_product_id": result.get("name", ""),
+                "hub_sku":        result.get("sku", ""),
+                "sync_status":    "Mapped",
+                "sync_error":     "",
+                "last_synced":    frappe.utils.now_datetime(),
+            })
+            mapping = frappe.get_doc("Product Mapping", row.name)
+            mapping._auto_create_vendor_listing(result)
 
 
 @frappe.whitelist()
@@ -126,7 +150,7 @@ def bulk_import(csv_content):
         if not frappe.db.exists("Item", item_code):
             errors.append(f"Row {i}: item_code {item_code} not found in ERPNext")
             continue
-        if frappe.db.exists("Product Mapping", {"barcode": barcode}):
+        if frappe.db.exists("Product Mapping", {"barcode": barcode, "vendor": config.vendor_id}):
             skipped += 1
             continue
 
@@ -136,6 +160,7 @@ def bulk_import(csv_content):
         doc = frappe.new_doc("Product Mapping")
         doc.barcode    = barcode
         doc.item_code  = item_code
+        doc.vendor     = config.vendor_id
         if hub_result:
             doc.hub_product_id = hub_result.get("name", "")
             doc.hub_sku        = hub_result.get("sku", "")
@@ -147,6 +172,8 @@ def bulk_import(csv_content):
         try:
             doc.insert(ignore_permissions=True)
             created += 1
+            if doc.sync_status == "Mapped":
+                doc._auto_create_vendor_listing(hub_result)
         except Exception as e:
             errors.append(f"Row {i}: {str(e)[:100]}")
 
@@ -163,7 +190,7 @@ def sync_all_unmapped():
 
     unmapped = frappe.get_list(
         "Product Mapping",
-        filters={"sync_status": ["in", ["Unmapped", "Error"]], "is_active": 1},
+        filters={"sync_status": ["in", ["Unmapped", "Error"]], "is_active": 1, "vendor": config.vendor_id},
         fields=["name", "barcode"],
     )
     fixed = failed = 0
@@ -178,9 +205,17 @@ def sync_all_unmapped():
                 "sync_error":     "",
                 "last_synced":    frappe.utils.now_datetime(),
             })
+            mapping = frappe.get_doc("Product Mapping", row.name)
+            mapping._auto_create_vendor_listing(result)
             fixed += 1
         else:
             failed += 1
 
     frappe.db.commit()
     return {"fixed": fixed, "still_unmapped": failed}
+
+
+@frappe.whitelist()
+def sync_all_mapped():
+    """Push stock for all mapped products (same as sync_vendor_stock but explicit)."""
+    return sync_vendor_stock()

@@ -10,6 +10,9 @@ REDIS_CACHE="${REDIS_CACHE:-redis://redis-cache:6379}"
 REDIS_QUEUE="${REDIS_QUEUE:-redis://redis-queue:6379}"
 VENDOR_SITES="${VENDOR_SITES:-vendor1.localhost vendor2.localhost vendor3.localhost}"
 PORT="${VENDOR_PORT:-8000}"
+# Shared secret vendor sites sign their hub pushes with (X-SM-Secret header).
+# Must match the hub's Settings.webhook_secret — see saathimart/docker/init.sh.
+WEBHOOK_SECRET="${WEBHOOK_SECRET:-saathimart-webhook-secret}"
 
 wait_for() {
   local host=$1 port=$2 label=$3
@@ -88,7 +91,9 @@ bench set-config -g db_host "$DB_HOST"
 # Create / migrate each vendor site. install-app is idempotent (no-op if
 # already installed), so it always runs to recover sites left with a
 # missing app install by a prior failed attempt.
+SITE_INDEX=0
 for SITE in $VENDOR_SITES; do
+  SITE_INDEX=$((SITE_INDEX + 1))
   if [ ! -d "$BENCH/sites/$SITE" ] || [ ! -f "$BENCH/sites/$SITE/site_config.json" ]; then
     echo "Creating site $SITE..."
     rm -rf "$BENCH/sites/$SITE"
@@ -109,13 +114,21 @@ for SITE in $VENDOR_SITES; do
   bench --site "$SITE" migrate
 
   # Configure Vendor Config for this site
+  #
+  # Must run with cwd = $BENCH/sites: Frappe's per-site log handler builds
+  # its file path as a *relative* join of site + "logs" + logfile (see
+  # frappe/utils/logger.py:create_handler), so frappe.connect() throws
+  # FileNotFoundError from anywhere else instead of writing to the real
+  # sites/<site>/logs directory.
   VENDOR_ID="${SITE}"
   echo "Configuring Vendor Config for $VENDOR_ID..."
-  cd "$BENCH" && "$BENCH/env/bin/python" - "$SITE" "$VENDOR_ID" <<'PYEOF'
+  cd "$BENCH/sites" && "$BENCH/env/bin/python" - "$SITE" "$VENDOR_ID" "$SITE_INDEX" "$WEBHOOK_SECRET" <<'PYEOF'
 import sys
 import frappe
 site = sys.argv[1]
 vendor_id = sys.argv[2]
+site_index = int(sys.argv[3])
+webhook_secret = sys.argv[4]
 frappe.init(site, sites_path='/home/frappe/bench/sites')
 frappe.connect()
 config = frappe.get_single('Vendor Config')
@@ -124,32 +137,35 @@ config.hub_site = 'saathimart.localhost'
 config.vendor_id = vendor_id
 config.api_key = f'vendor-api-key-{vendor_id}'
 config.api_secret = f'vendor-api-secret-{vendor_id}'
-config.webhook_secret = 'saathimart-webhook-secret'
+config.webhook_secret = webhook_secret
 config.sync_enabled = 1
 config.reconciliation_enabled = 1
 
-# Set vendor location based on site name (for demo/testing)
-# In production, these would be set by the vendor via desk or API
-if 'baneshwor' in vendor_id.lower():
-    config.lat = 27.7172
-    config.lng = 85.3240
-    config.address = 'Baneshwor, Kathmandu'
-    config.service_radius_km = 5
-elif 'koteshwor' in vendor_id.lower():
-    config.lat = 27.7042
-    config.lng = 85.3434
-    config.address = 'Koteshwor, Kathmandu'
-    config.service_radius_km = 5
-elif 'thamel' in vendor_id.lower():
-    config.lat = 27.7172
-    config.lng = 85.3106
-    config.address = 'Thamel, Kathmandu'
-    config.service_radius_km = 5
-else:
-    config.lat = 27.7172
-    config.lng = 85.3240
-    config.address = 'Kathmandu, Nepal'
-    config.service_radius_km = 5
+# Set vendor location based on site name when it names a known area (for
+# demo/testing); otherwise round-robin a small set of distinct Kathmandu
+# points keyed by this site's position in VENDOR_SITES, so the default
+# vendor1/vendor2/vendor3 names don't all collapse onto the same coordinates
+# and defeat nearest-vendor distance selection on the hub.
+# In production, these would be set by the vendor via desk or API instead.
+KNOWN_AREAS = {
+    'baneshwor': (27.7172, 85.3240, 'Baneshwor, Kathmandu'),
+    'koteshwor': (27.7042, 85.3434, 'Koteshwor, Kathmandu'),
+    'thamel':    (27.7172, 85.3106, 'Thamel, Kathmandu'),
+}
+ROUND_ROBIN_POINTS = [
+    (27.7172, 85.3240, 'Baneshwor, Kathmandu'),
+    (27.7042, 85.3434, 'Koteshwor, Kathmandu'),
+    (27.7172, 85.3106, 'Thamel, Kathmandu'),
+    (27.6939, 85.2827, 'Kalanki, Kathmandu'),
+    (27.6710, 85.4298, 'Bhaktapur'),
+]
+
+matched = next((v for k, v in KNOWN_AREAS.items() if k in vendor_id.lower()), None)
+if matched is None:
+    matched = ROUND_ROBIN_POINTS[(site_index - 1) % len(ROUND_ROBIN_POINTS)]
+
+config.lat, config.lng, config.address = matched
+config.service_radius_km = 5
 
 # default_warehouse is the single warehouse Sales Orders get fulfilled
 # from and stock levels get read from (see utils.py/tasks.py/vendor_order.py)
@@ -218,6 +234,7 @@ config.save(ignore_permissions=True)
 frappe.db.commit()
 print(f'  Vendor Config saved for {vendor_id}')
 PYEOF
+  cd "$BENCH"
 done
 
 # Sync vendor location to hub. Runs once, after every site above has been
@@ -242,9 +259,19 @@ done
 
 bench build --app saathimart_vendor || true
 
+# `frappe.app:application` (the raw WSGI callable gunicorn would otherwise
+# import) never serves /assets or /files — that middleware only gets
+# applied inside frappe.app.serve(), which a bare gunicorn import never
+# calls. This compose stack has no nginx in front to serve those paths
+# from disk instead, so wrap the app here or every JS/CSS asset 404s.
+cat > "$BENCH/sites/gunicorn_wsgi.py" <<'EOF'
+import frappe.app
+application = frappe.app.application_with_statics()
+EOF
+
 # Create Procfile for bench start with full gunicorn path
 cat > "$BENCH/Procfile" <<'EOF'
-web: cd /home/frappe/bench/sites && /home/frappe/bench/env/bin/gunicorn --bind 0.0.0.0:8000 frappe.app:application
+web: cd /home/frappe/bench/sites && /home/frappe/bench/env/bin/gunicorn --bind 0.0.0.0:8000 gunicorn_wsgi:application
 EOF
 
 echo "=== Starting vendor sites on port $PORT ==="

@@ -49,8 +49,9 @@ def on_stock_ledger_entry_submit(doc, method):
         return
 
     # Skip if this SLE is from a SaathiMart order that was already handled
-    # (the order flow handles its own stock events)
-    if doc.voucher_type == "Sales Invoice" and _is_saathimart_order_from_si(doc):
+    # by the order flow (the order flow handles its own stock events).
+    # Covers Sales Invoice and Delivery Note for SaathiMart orders.
+    if doc.voucher_type in ("Sales Invoice", "Delivery Note") and _is_saathimart_order(doc):
         return
 
     mapping = get_mapping(doc.item_code)
@@ -107,6 +108,10 @@ def on_stock_ledger_entry_cancel(doc, method):
     if not config or not config.sync_enabled:
         return
 
+    # Skip if this SLE cancel is for a SaathiMart order
+    if doc.voucher_type in ("Sales Invoice", "Delivery Note") and _is_saathimart_order(doc):
+        return
+
     mapping = get_mapping(doc.item_code)
     if not mapping:
         return
@@ -144,9 +149,20 @@ def on_stock_ledger_entry_cancel(doc, method):
     )
 
 
-def _is_saathimart_order_from_si(doc):
-    for item in (doc.get("items") or []):
-        so = getattr(item, "against_sales_order", None) or getattr(item, "sales_order", None)
-        if so and frappe.db.exists("Vendor Order", {"sales_order": so}):
-            return True
+def _is_saathimart_order(doc):
+    """Check if this SLE is from a SaathiMart order."""
+    voucher_type = doc.voucher_type
+    voucher_no = doc.voucher_no
+    if not voucher_no:
+        return False
+    if voucher_type == "Sales Invoice":
+        for item in (doc.get("items") or []):
+            so = getattr(item, "against_sales_order", None) or getattr(item, "sales_order", None)
+            if so and frappe.db.exists("Vendor Order", {"sales_order": so}):
+                return True
+    if voucher_type == "Delivery Note":
+        for item in (doc.get("items") or []):
+            so = getattr(item, "against_sales_order", None) or getattr(item, "sales_order", None)
+            if so and frappe.db.exists("Vendor Order", {"sales_order": so}):
+                return True
     return False

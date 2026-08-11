@@ -3,6 +3,11 @@ from saathimart_vendor.utils import get_config, enqueue_outbox, get_site_url, ne
 
 
 def on_sales_order_submit(doc, method):
+    if frappe.flags.get("in_vendor_order_accept"):
+        # VendorOrder.accept_order() is submitting this Sales Order itself
+        # and will enqueue order.confirmed on its own — skip to avoid a
+        # duplicate event.
+        return
     hub_order_id = frappe.db.get_value(
         "Vendor Order", {"sales_order": doc.name}, "hub_order_id"
     )
@@ -25,6 +30,11 @@ def on_sales_order_submit(doc, method):
 
 
 def on_sales_order_cancel(doc, method):
+    if frappe.flags.get("in_vendor_order_cancel"):
+        # VendorOrder.cancel_order() is cancelling this Sales Order itself
+        # and will set the status + enqueue order.cancel on its own (with
+        # the vendor-supplied reason) — skip to avoid a duplicate event.
+        return
     hub_order_id = frappe.db.get_value(
         "Vendor Order", {"sales_order": doc.name}, "hub_order_id"
     )
@@ -57,10 +67,16 @@ def on_delivery_note_submit(doc, method):
             break
     if not so_name:
         return
-    hub_order_id = frappe.db.get_value(
-        "Vendor Order", {"sales_order": so_name}, "hub_order_id"
+    vendor_order = frappe.db.get_value(
+        "Vendor Order", {"sales_order": so_name}, ["name", "hub_order_id", "status"], as_dict=True
     )
-    if not hub_order_id:
+    if not vendor_order or not vendor_order.hub_order_id:
+        return
+    if vendor_order.status == "Dispatched":
+        # VendorOrder.mark_dispatched() already advanced this order (e.g. a
+        # vendor who fulfills instantly clicked the button before a real
+        # Delivery Note was ever created for it) — a Delivery Note submitted
+        # afterwards for bookkeeping shouldn't re-emit order.dispatched.
         return
     config = get_config()
     if not config:
@@ -68,7 +84,7 @@ def on_delivery_note_submit(doc, method):
     enqueue_outbox(
         event_type="order.dispatched",
         payload={
-            "order_id": hub_order_id,
+            "order_id": vendor_order.hub_order_id,
             "vendor_id": config.vendor_id,
             "delivery_note": doc.name,
             "event_id": generate_event_id(),
@@ -76,9 +92,10 @@ def on_delivery_note_submit(doc, method):
         },
         voucher_type="Delivery Note", voucher_no=doc.name,
     )
-    frappe.db.set_value("Vendor Order", {"sales_order": so_name}, "status", "Dispatched")
-    frappe.db.set_value("Vendor Order", {"sales_order": so_name},
-                        "dispatched_at", frappe.utils.now_datetime())
+    frappe.db.set_value("Vendor Order", vendor_order.name, {
+        "status": "Dispatched",
+        "dispatched_at": frappe.utils.now_datetime(),
+    })
 
 
 def on_delivery_note_cancel(doc, method):
@@ -89,4 +106,13 @@ def on_delivery_note_cancel(doc, method):
             break
     if not so_name:
         return
-    frappe.db.set_value("Vendor Order", {"sales_order": so_name}, "status", "Accepted")
+    vendor_order = frappe.db.get_value(
+        "Vendor Order", {"sales_order": so_name}, ["name", "status"], as_dict=True
+    )
+    if not vendor_order or vendor_order.status != "Dispatched":
+        # Only revert a status this same Delivery Note actually caused.
+        # If the vendor has since marked it Delivered (or it was already
+        # Cancelled), a Delivery Note cancellation for paperwork reasons
+        # shouldn't regress that.
+        return
+    frappe.db.set_value("Vendor Order", vendor_order.name, "status", "Accepted")
