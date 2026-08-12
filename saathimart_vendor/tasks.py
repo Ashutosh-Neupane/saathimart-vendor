@@ -1,13 +1,37 @@
 import json
+import zlib
 import frappe
 import requests
-from frappe.utils import now_datetime, add_to_date, nowdate, get_url
-from saathimart_vendor.utils import get_config, enqueue_outbox, hub_headers
+from frappe.utils import now_datetime, add_to_date, nowdate, get_url, get_datetime
+from saathimart_vendor.utils import get_config, enqueue_outbox, hub_headers, safe_enqueue
 
 
 # ── Outbox flush (every 1 min) ────────────────────────────────────────────────
 
+BULK_CHUNK_SIZE = 50
+
+
 def flush_outbox():
+    """
+    Cron every 1 min — deliver pending Sync Outbox rows. Each row also gets
+    its own instant single-row delivery attempt at write time (see
+    utils.enqueue_outbox) — this sweep is the fallback for anything that
+    missed that (instant push failed, worker pool was backed up) or piled
+    up faster than one-at-a-time delivery could drain it.
+
+    Chunks pending rows into groups of BULK_CHUNK_SIZE and sends each
+    multi-row group as one bulk_receive HTTP call instead of one row = one
+    HTTP call. This is real batching, using the Sync Outbox table itself as
+    the buffer — a single-row chunk still goes through the plain
+    single-event endpoint, no bulk overhead for the common small case.
+    (An earlier version of this batching used an in-memory module-level
+    buffer flushed by a separate background job — that couldn't work:
+    every enqueue_outbox() call can run in a different gunicorn worker
+    process, and the "flush later" job runs in yet another (RQ worker)
+    process again, so the deferred flush always found an empty buffer.
+    Reading pending rows straight from the DB here doesn't have that
+    problem — one process, one query, real data.)
+    """
     config = get_config()
     if not config or not config.sync_enabled:
         return
@@ -18,11 +42,77 @@ def flush_outbox():
         WHERE status = 'Pending'
           AND (next_retry_at IS NULL OR next_retry_at <= NOW())
         ORDER BY creation ASC
-        LIMIT 200
+        LIMIT 1000
     """, as_dict=True)
 
-    for row in pending:
-        _push_to_hub(config, row)
+    for i in range(0, len(pending), BULK_CHUNK_SIZE):
+        chunk = pending[i:i + BULK_CHUNK_SIZE]
+        if len(chunk) == 1:
+            _push_to_hub(config, chunk[0])
+        else:
+            _push_bulk(config, chunk)
+
+
+def _push_one_now(row_name):
+    """
+    Deliver a single pending Sync Outbox row right away, instead of waiting
+    for the next flush_outbox cron tick (which stays as the retry/fallback
+    sweep for anything the instant path missed). Called via
+    saathimart_vendor.utils.enqueue_outbox with enqueue_after_commit=True,
+    so this only ever runs once the transaction that wrote the row has
+    actually committed.
+    """
+    config = get_config()
+    if not config or not config.sync_enabled:
+        return
+    row = frappe.db.get_value(
+        "Sync Outbox", row_name,
+        ["name", "event_type", "payload", "retry_count", "status"],
+        as_dict=True,
+    )
+    if not row or row.status != "Pending":
+        return  # already delivered (or picked up) by flush_outbox's cron sweep
+    _push_to_hub(config, row)
+
+
+def _push_bulk(config, rows):
+    """
+    Deliver multiple pending Sync Outbox rows in a single HTTP POST to the
+    hub's bulk_receive endpoint. On failure, every row in the batch gets
+    its own retry bookkeeping via _handle_failure — not just the first one
+    (a real bug in an earlier version of this: only rows[0] ever got its
+    retry_count incremented on a batch failure, so the rest silently never
+    escalated to Dead / triggered the admin alert no matter how long they
+    kept failing).
+    """
+    events = [
+        {"event": row.event_type, "payload": json.loads(row.payload or "{}")}
+        for row in rows
+    ]
+
+    try:
+        resp = requests.post(
+            f"{config.hub_url}/api/method/saathimart.api.events.bulk_receive",
+            json={"events": events},
+            headers=hub_headers(config),
+            timeout=30,
+        )
+        if resp.ok:
+            for row in rows:
+                frappe.db.set_value("Sync Outbox", row.name, {
+                    "status": "Sent",
+                    "last_error": "",
+                })
+        else:
+            error_msg = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            for row in rows:
+                _handle_failure(config, row, error_msg)
+    except Exception as e:
+        error_msg = str(e)[:200]
+        for row in rows:
+            _handle_failure(config, row, error_msg)
+
+    frappe.db.commit()
 
 
 def _push_to_hub(config, row):
@@ -80,6 +170,63 @@ def _handle_failure(config, row, error):
         )
 
 
+# ── Catch-up polling (every 5 min) ───────────────────────────────────────────
+
+def catch_up_with_hub():
+    """
+    Pull any events targeted at this vendor that a plain webhook push might
+    have missed entirely — the site was down when the hub tried to push, or
+    the hub's own retries were exhausted and the event went Dead. Before
+    this, there was no way back for a vendor in that state short of someone
+    noticing and manually re-triggering a sync.
+
+    Runs the same handler dispatch as a live push
+    (saathimart_vendor.api.receive.dispatch_event), so a replayed event is
+    processed identically to one that arrived live — same idempotency
+    guarantees, no separate replay logic to keep in sync.
+
+    Cheap when there's nothing to catch up on: a single GET that returns an
+    empty list once `since` is caught up to the hub's latest event_seq for
+    this vendor.
+    """
+    config = get_config()
+    if not config or not config.sync_enabled:
+        return
+
+    from saathimart_vendor.api.receive import dispatch_event
+
+    since = config.last_hub_event_seq or 0
+    try:
+        resp = requests.get(
+            f"{config.hub_url}/api/method/saathimart.api.events.poll",
+            params={"since": since, "limit": 50},
+            headers=hub_headers(config),
+            timeout=15,
+        )
+    except Exception as e:
+        frappe.log_error(str(e), "SaathiMart Catch-Up Poll")
+        return
+
+    if not resp.ok:
+        return
+
+    events = (resp.json().get("message") or {}).get("events") or []
+    max_seq = since
+    for evt in events:
+        try:
+            dispatch_event(evt.get("event_type"), evt.get("payload") or {})
+        except Exception:
+            frappe.log_error(
+                frappe.get_traceback(),
+                f"Catch-up replay failed: {evt.get('event_type')}",
+            )
+        max_seq = max(max_seq, evt.get("event_seq") or 0)
+
+    if max_seq != since:
+        frappe.db.set_value("Vendor Config", config.name, "last_hub_event_seq", max_seq)
+        frappe.db.commit()
+
+
 # ── Hub health check (every 5 min) ───────────────────────────────────────────
 
 def check_hub_health():
@@ -106,12 +253,60 @@ def check_hub_health():
     frappe.db.commit()
 
 
+# ── Daily outbox archival ─────────────────────────────────────────────────────
+
+def archive_old_outbox():
+    """
+    Daily cron — purge old, fully-resolved Sync Outbox rows (Sent or Dead;
+    Pending/Failed rows are still live work and left alone). Mirrors the
+    hub's own Webhook Event cleanup (saathimart.api.archival.archive_old_data)
+    — that job used to also try to delete from this exact table directly on
+    the hub's database, which doesn't have it; this is the corrected,
+    same-side version.
+    """
+    frappe.db.sql("""
+        DELETE FROM `tabSync Outbox`
+        WHERE status IN ('Sent', 'Dead')
+          AND creation < DATE_SUB(NOW(), INTERVAL 30 DAY)
+        LIMIT 1000
+    """)
+    frappe.db.commit()
+
+
 # ── Hourly stock reconciliation ───────────────────────────────────────────────
 
-def reconcile_stock():
+@frappe.whitelist()
+def reconcile_stock(force=False):
+    """
+    Runs on a */10 cron (see hooks.py) but only actually does work roughly
+    once an hour, in a slot derived from this vendor's own vendor_id.
+
+    Why not just a straight "0 * * * *" hourly cron: every vendor site runs
+    its own independent bench scheduler, so a fixed top-of-the-hour cron
+    means every vendor in the whole system hits the hub's
+    get_vendor_stock_batch endpoint in the same handful of seconds, every
+    hour, regardless of vendor count — a synchronized thundering herd that
+    gets worse the more vendors there are, rather than better. Spreading
+    each vendor into a stable ~10-minute slot (hash of vendor_id, so it's
+    consistent across runs but different across vendors) turns that
+    simultaneous spike into a roughly even trickle across the hour.
+
+    force=True bypasses both the slot and staleness gates — a vendor desk
+    user clicking "Reconcile Now" (or a test) shouldn't have to wait for
+    their own hourly window.
+    """
     config = get_config()
     if not config or not config.reconciliation_enabled:
         return
+
+    if not force:
+        vendor_slot = zlib.crc32(config.vendor_id.encode()) % 6
+        current_slot = now_datetime().minute // 10
+        if vendor_slot != current_slot:
+            return
+
+        if config.last_sync_at and (now_datetime() - get_datetime(config.last_sync_at)).total_seconds() < 55 * 60:
+            return
 
     mappings = frappe.get_list(
         "Product Mapping",
@@ -128,7 +323,7 @@ def reconcile_stock():
     chunks = [mappings[i:i + chunk_size] for i in range(0, len(mappings), chunk_size)]
 
     for idx, chunk in enumerate(chunks):
-        frappe.enqueue(
+        safe_enqueue(
             "saathimart_vendor.tasks._reconcile_chunk",
             config_name=config.name,
             mappings=chunk,

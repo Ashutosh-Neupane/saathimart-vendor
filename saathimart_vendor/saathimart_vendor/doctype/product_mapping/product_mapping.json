@@ -5,8 +5,9 @@
   "autoname": "MAP-.YYYY.-.#####",
   "track_changes": 1,
   "fields": [
-   {"fieldname": "vendor", "fieldtype": "Link", "label": "Vendor",
-    "options": "Vendor", "reqd": 1, "in_list_view": 1},
+   {"fieldname": "vendor", "fieldtype": "Data", "label": "Vendor",
+    "reqd": 1, "in_list_view": 1,
+    "description": "This vendor's own vendor_id (Vendor Config.vendor_id) as known to the hub — not a Link, because the hub's Vendor doctype lives in a completely separate app/database (saathimart), not here. Every other cross-app reference in this app (Webhook Event.target_vendor, Sync Outbox payloads) uses the same plain-Data convention for the same reason."},
    {"fieldname": "barcode", "fieldtype": "Data", "label": "Barcode", "reqd": 1,
     "in_list_view": 1,
     "description": "Physical barcode on the product — the shared key across all vendors"},

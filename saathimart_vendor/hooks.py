@@ -30,18 +30,35 @@ doc_events = {
         "after_insert": "saathimart_vendor.event_handlers.pricing.on_item_price_change",
         "on_update":    "saathimart_vendor.event_handlers.pricing.on_item_price_change",
     },
+    # Frappe doesn't fire doc_events (after_insert/on_update) on child-table
+    # rows when the parent is saved — Item Barcode rows are inserted via a
+    # raw db_insert() with no lifecycle hooks of their own (see
+    # frappe/model/document.py's insert()/_save(), which only ever calls
+    # run_method() on the document being saved, not its children). So this
+    # hooks the parent Item instead and reads doc.barcodes off it.
+    "Item": {
+        "after_insert": "saathimart_vendor.event_handlers.mapping.on_item_barcode_change",
+        "on_update":    "saathimart_vendor.event_handlers.mapping.on_item_barcode_change",
+    },
 }
 
 # ── Scheduled tasks ───────────────────────────────────────────────────
 scheduler_events = {
+    "daily": [
+        "saathimart_vendor.tasks.archive_old_outbox",
+    ],
     "cron": {
         "* * * * *": [
             "saathimart_vendor.tasks.flush_outbox",
         ],
         "*/5 * * * *": [
             "saathimart_vendor.tasks.check_hub_health",
+            "saathimart_vendor.tasks.catch_up_with_hub",
         ],
-        "0 * * * *": [
+        "*/10 * * * *": [
+            # Fires every 10 min, but reconcile_stock() itself only does
+            # real work once/hour, in a per-vendor jittered slot — see its
+            # docstring. Not a straight hourly cron on purpose.
             "saathimart_vendor.tasks.reconcile_stock",
         ],
     }

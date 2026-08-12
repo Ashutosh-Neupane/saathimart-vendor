@@ -29,6 +29,49 @@ import frappe
 from frappe.utils import flt, now_datetime, today, getdate
 
 
+# ── Module-level fixture isolation ──────────────────────────────────────────
+# Vendor Config is a Frappe Single — every _configure_vendor() call below
+# overwrites the one real row for this site, and plain unittest.TestCase
+# (used throughout this file, not frappe.tests.utils.FrappeTestCase) gives
+# no automatic per-test rollback. Left unrestored, a live site's real
+# hub_url/vendor_id/api credentials silently end up holding test fixture
+# values after `bench run-tests` finishes — this already happened once and
+# broke real vendor->hub sync (bad hub_url) until it was manually caught and
+# fixed. setUpModule/tearDownModule run exactly once around this whole
+# file's test run, regardless of how many classes call _configure_vendor(),
+# so whatever was really configured before the suite ran is always restored
+# after — without touching the many individual tests that rely on it being
+# mutable mid-suite.
+_VENDOR_CONFIG_FIELDS = [
+    "hub_url", "vendor_id", "api_key", "sync_enabled",
+    "reconciliation_enabled", "default_warehouse", "lat", "lng",
+]
+_original_vendor_config = None
+_original_vendor_api_secret = None
+
+
+def setUpModule():
+    global _original_vendor_config, _original_vendor_api_secret
+    frappe.set_user("Administrator")
+    doc = frappe.get_single("Vendor Config")
+    _original_vendor_config = {f: doc.get(f) for f in _VENDOR_CONFIG_FIELDS}
+    _original_vendor_api_secret = doc.get_password("api_secret", raise_exception=False)
+
+
+def tearDownModule():
+    if _original_vendor_config is None:
+        return
+    frappe.set_user("Administrator")
+    doc = frappe.get_single("Vendor Config")
+    for field, value in _original_vendor_config.items():
+        doc.set(field, value)
+    if _original_vendor_api_secret is not None:
+        doc.api_secret = _original_vendor_api_secret
+    doc.flags.ignore_mandatory = True
+    doc.save(ignore_permissions=True)
+    frappe.db.commit()
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _ensure_fiscal_year():
@@ -117,8 +160,15 @@ def _make_item(item_code, item_name=None):
     return doc
 
 
-def _configure_vendor(vendor_id="vendor-test-a", hub_url="http://hub.test:8000",
+def _configure_vendor(vendor_id="vendor-test-a", hub_url="http://hub:8000",
                       warehouse=None, sync_enabled=1, reconciliation_enabled=1):
+    # Vendor Config is a Frappe Single — every test run overwrites the same
+    # site-wide row, and it is never restored afterward. hub_url must
+    # therefore default to the real docker-network hostname ("hub", the
+    # sm-hub service) rather than a placeholder: a fake host here silently
+    # breaks every real vendor->hub push (orders, stock, price) until
+    # someone notices and manually reconfigures it, which is exactly what
+    # happened live in this environment before this default was fixed.
     doc = frappe.get_single("Vendor Config")
     doc.hub_url = hub_url
     doc.vendor_id = vendor_id
@@ -135,9 +185,13 @@ def _configure_vendor(vendor_id="vendor-test-a", hub_url="http://hub.test:8000",
 
 
 def _make_mapping(barcode, item_code, hub_product_id=None, sync_status="Mapped"):
-    existing = frappe.db.get_value("Product Mapping", {"barcode": barcode}, "name")
-    if existing:
-        return frappe.get_doc("Product Mapping", existing)
+    # Always fresh, never a reuse-if-exists — a leftover row from an earlier
+    # run (this file uses plain unittest.TestCase, so nothing rolls back
+    # between `bench run-tests` invocations) used to get silently returned
+    # as-is here regardless of the sync_status the *current* test asked for,
+    # which made test_sync_all_unmapped_fixes_mapped flake depending on
+    # whether it was the first or a later run against the same site.
+    frappe.db.delete("Product Mapping", {"barcode": barcode})
     _make_item(item_code)
     doc = frappe.new_doc("Product Mapping")
     doc.barcode = barcode
@@ -167,20 +221,20 @@ class TestVendorConfig(unittest.TestCase):
 
     def test_vendor_id_required(self):
         doc = frappe.get_single("Vendor Config")
-        doc.hub_url = "http://hub.test:8000"
+        doc.hub_url = "http://hub:8000"
         doc.vendor_id = ""
         with self.assertRaises(frappe.ValidationError):
             doc.save(ignore_permissions=True)
 
     def test_hub_url_trailing_slash_stripped(self):
         doc = frappe.get_single("Vendor Config")
-        doc.hub_url = "http://hub.test:8000/"
+        doc.hub_url = "http://hub:8000/"
         doc.vendor_id = "vendor-test-slash"
         doc.default_warehouse = _ensure_warehouse()
         doc.lat = 27.7
         doc.lng = 85.3
         doc.save(ignore_permissions=True)
-        self.assertEqual(doc.hub_url, "http://hub.test:8000")
+        self.assertEqual(doc.hub_url, "http://hub:8000")
 
     def test_get_config_returns_none_when_incomplete(self):
         from saathimart_vendor.utils import get_config
@@ -217,15 +271,20 @@ class TestProductMapping(unittest.TestCase):
             doc.insert(ignore_permissions=True)
 
     def test_duplicate_barcode_rejected(self):
+        # Barcode uniqueness is scoped to (vendor, barcode) by design — the
+        # same physical barcode can be mapped independently by different
+        # vendors (see product_mapping.json's vendor field). What must
+        # still be rejected is the *same* vendor mapping the same barcode
+        # to two different items, which is an application-level check in
+        # validate() (frappe.ValidationError), not a DB-level unique
+        # constraint on barcode alone (which would incorrectly block
+        # different vendors from sharing a barcode).
         _make_mapping("8901234500001", "VT-ITEM-002")
         _make_item("VT-ITEM-002B")
         dupe = frappe.new_doc("Product Mapping")
         dupe.barcode = "8901234500001"
         dupe.item_code = "VT-ITEM-002B"
-        # a barcode unique-constraint violation, not a name/primary-key
-        # collision — those are DuplicateEntryError (a NameError subclass);
-        # this is UniqueValidationError (a ValidationError subclass).
-        with self.assertRaises(frappe.UniqueValidationError):
+        with self.assertRaises(frappe.ValidationError):
             dupe.insert(ignore_permissions=True)
 
     @patch("saathimart_vendor.saathimart_vendor.doctype.product_mapping.product_mapping.hub_get")
@@ -341,6 +400,77 @@ class TestSyncOutbox(unittest.TestCase):
         )
         self.assertEqual(status, "Pending")
         _configure_vendor(vendor_id="vendor-test-outbox", sync_enabled=1)
+
+    @patch("saathimart_vendor.tasks.requests.post")
+    def test_flush_outbox_batches_multiple_pending_rows_into_one_bulk_call(self, mock_post):
+        """
+        Real batching happens by reading pending rows straight off the
+        Sync Outbox table inside flush_outbox() — not via an in-memory
+        buffer (an earlier version tried that; it couldn't work, since
+        each enqueue_outbox() call can run in a different process than
+        the one that would eventually flush it). With >1 pending row this
+        must hit bulk_receive once, not events.receive N times.
+        """
+        from saathimart_vendor.utils import enqueue_outbox
+        from saathimart_vendor.tasks import flush_outbox
+
+        mock_post.return_value = MagicMock(ok=True, status_code=200)
+        for i in range(3):
+            enqueue_outbox("price.update", {"product_id": f"SM-PROD-BATCH-{i}"},
+                           voucher_type="Test Voucher", voucher_no=f"TV-BATCH-{i}")
+        flush_outbox()
+
+        self.assertEqual(mock_post.call_count, 1)
+        called_url = mock_post.call_args.args[0]
+        self.assertIn("bulk_receive", called_url)
+        sent_events = mock_post.call_args.kwargs["json"]["events"]
+        self.assertEqual(len(sent_events), 3)
+        for i in range(3):
+            status = frappe.db.get_value(
+                "Sync Outbox", {"voucher_type": "Test Voucher", "voucher_no": f"TV-BATCH-{i}"}, "status"
+            )
+            self.assertEqual(status, "Sent")
+
+    @patch("saathimart_vendor.tasks.requests.post")
+    def test_flush_outbox_single_pending_row_uses_plain_endpoint(self, mock_post):
+        """A lone pending row shouldn't pay bulk overhead — same as before batching existed."""
+        from saathimart_vendor.utils import enqueue_outbox
+        from saathimart_vendor.tasks import flush_outbox
+
+        mock_post.return_value = MagicMock(ok=True, status_code=200)
+        enqueue_outbox("price.update", {"product_id": "SM-PROD-SOLO"},
+                       voucher_type="Test Voucher", voucher_no="TV-SOLO")
+        flush_outbox()
+
+        called_url = mock_post.call_args.args[0]
+        self.assertIn("saathimart.api.events.receive", called_url)
+        self.assertNotIn("bulk_receive", called_url)
+
+    @patch("saathimart_vendor.tasks.requests.post")
+    def test_bulk_push_failure_updates_retry_count_for_every_row_not_just_first(self, mock_post):
+        """
+        Regression test: an earlier version of _push_bulk only called
+        _handle_failure on rows[0] when a batch failed, so every other row
+        in the batch kept retry_count=0 forever and could never escalate
+        to Dead or trigger the admin alert, no matter how long it failed.
+        """
+        from saathimart_vendor.utils import enqueue_outbox
+        from saathimart_vendor.tasks import flush_outbox
+
+        mock_post.return_value = MagicMock(ok=False, status_code=500, text="down")
+        for i in range(4):
+            enqueue_outbox("price.update", {"product_id": f"SM-PROD-BATCHFAIL-{i}"},
+                           voucher_type="Test Voucher", voucher_no=f"TV-BATCHFAIL-{i}")
+        flush_outbox()
+
+        for i in range(4):
+            row = frappe.db.get_value(
+                "Sync Outbox", {"voucher_type": "Test Voucher", "voucher_no": f"TV-BATCHFAIL-{i}"},
+                ["status", "retry_count", "next_retry_at"], as_dict=True,
+            )
+            self.assertEqual(row.status, "Pending")
+            self.assertEqual(row.retry_count, 1, f"row {i} did not get its retry_count bumped")
+            self.assertIsNotNone(row.next_retry_at)
 
 
 # ── Test: Stock hooks ───────────────────────────────────────────────────────────
@@ -592,6 +722,12 @@ class TestVendorOrderLifecycle(unittest.TestCase):
         frappe.set_user("Administrator")
         self.config = _configure_vendor(vendor_id="vendor-test-lifecycle")
         self.mapping = _make_mapping("8901234500020", "VT-ITEM-ORDER")
+        # mark_dispatched() now submits a real Delivery Note against
+        # whatever stock actually exists — this suite deliberately never
+        # seeds real stock receipts (see module docstring), so allow
+        # negative stock here rather than adding a full Stock Entry setup
+        # just to make a Delivery Note submit successfully.
+        frappe.db.set_single_value("Stock Settings", "allow_negative_stock", 1)
 
     def _make_received_order(self, hub_order_id, items=None):
         # frappe.db.delete() is a raw table-only delete — it does not
@@ -659,19 +795,54 @@ class TestVendorOrderLifecycle(unittest.TestCase):
         vo = self._make_received_order("HUB-ORDER-DISPATCH-001")
         vo.accept_order()
         vo.reload()
-        vo.mark_dispatched()
+        result = vo.mark_dispatched()
         vo.reload()
         self.assertEqual(vo.status, "Dispatched")
         self.assertIsNotNone(vo.dispatched_at)
-        event_type = frappe.db.get_value(
-            "Sync Outbox", {"voucher_no": vo.name, "event_type": "order.dispatched"}, "event_type"
+        # mark_dispatched() now creates + submits a real Delivery Note
+        # against the linked Sales Order instead of just flipping status.
+        self.assertTrue(frappe.db.exists("Delivery Note", result["delivery_note"]))
+        self.assertEqual(frappe.db.get_value("Delivery Note", result["delivery_note"], "docstatus"), 1)
+        # mark_dispatched() enqueues with voucher_type="Delivery Note",
+        # voucher_no=dn.name — same convention on_delivery_note_submit uses
+        # for the same event, not the Vendor Order's own name.
+        event_row = frappe.db.get_value(
+            "Sync Outbox", {"voucher_no": result["delivery_note"], "event_type": "order.dispatched"},
+            ["event_type", "payload"], as_dict=True,
         )
-        self.assertEqual(event_type, "order.dispatched")
+        self.assertEqual(event_row.event_type, "order.dispatched")
+        self.assertIn(result["delivery_note"], event_row.payload)
+        # on_delivery_note_submit must not have also fired for this same
+        # submit — exactly one order.dispatched row for this delivery note, not two.
+        count = frappe.db.count("Sync Outbox", {"voucher_no": result["delivery_note"], "event_type": "order.dispatched"})
+        self.assertEqual(count, 1)
 
     def test_mark_dispatched_wrong_status_raises(self):
         vo = self._make_received_order("HUB-ORDER-DISPATCH-002")
         with self.assertRaises(frappe.ValidationError):
             vo.mark_dispatched()  # still "Received", not Accepted/Preparing
+
+    def test_mark_preparing_then_dispatch(self):
+        vo = self._make_received_order("HUB-ORDER-PREPARING-001")
+        vo.accept_order()
+        vo.reload()
+        vo.mark_preparing()
+        vo.reload()
+        self.assertEqual(vo.status, "Preparing")
+        self.assertIsNotNone(vo.preparing_at)
+        event_type = frappe.db.get_value(
+            "Sync Outbox", {"voucher_no": vo.name, "event_type": "order.preparing"}, "event_type"
+        )
+        self.assertEqual(event_type, "order.preparing")
+        # mark_dispatched()'s guard must still accept "Preparing", not just "Accepted"
+        vo.mark_dispatched()
+        vo.reload()
+        self.assertEqual(vo.status, "Dispatched")
+
+    def test_mark_preparing_wrong_status_raises(self):
+        vo = self._make_received_order("HUB-ORDER-PREPARING-002")
+        with self.assertRaises(frappe.ValidationError):
+            vo.mark_preparing()  # still "Received", not Accepted
 
     def test_mark_delivered_after_dispatch(self):
         vo = self._make_received_order("HUB-ORDER-DELIVER-001")
@@ -818,16 +989,39 @@ class TestTasks(unittest.TestCase):
         mock_enqueue.side_effect = lambda *a, **kw: _reconcile_chunk(kw["config_name"], kw["mappings"])
         _make_mapping("8901234500080", "VT-ITEM-RECON-1")
         _make_mapping("8901234500081", "VT-ITEM-RECON-2")
-        reconcile_stock()
+        # force=True bypasses the per-vendor hourly jitter slot (see
+        # reconcile_stock's docstring) — this test is about whether every
+        # active mapping gets visited, not about the scheduling gate, which
+        # would otherwise make this test's pass/fail depend on the wall-clock
+        # minute it happens to run at.
+        reconcile_stock(force=True)
         self.assertGreaterEqual(mock_reconcile_item.call_count, 2)
 
     @patch("saathimart_vendor.tasks._reconcile_item")
     def test_reconcile_stock_skips_when_disabled(self, mock_reconcile_item):
         from saathimart_vendor.tasks import reconcile_stock
         _configure_vendor(vendor_id="vendor-test-tasks", reconciliation_enabled=0)
-        reconcile_stock()
+        reconcile_stock(force=True)
         mock_reconcile_item.assert_not_called()
         _configure_vendor(vendor_id="vendor-test-tasks", reconciliation_enabled=1)
+
+    def test_reconcile_stock_skips_outside_own_jitter_slot(self):
+        from saathimart_vendor.tasks import reconcile_stock
+        config = _configure_vendor(vendor_id="vendor-test-jitter")
+        # Find a minute value guaranteed to fall in a *different* 10-minute
+        # bucket than this vendor's own slot, so the gate is exercised
+        # deterministically rather than depending on when the test happens
+        # to run.
+        import zlib
+        own_slot = zlib.crc32(config.vendor_id.encode()) % 6
+        other_slot = (own_slot + 1) % 6
+        with patch("saathimart_vendor.tasks.now_datetime") as mock_now:
+            mock_now.return_value = frappe.utils.get_datetime(
+                f"2026-01-01 {other_slot * 10:02d}:05:00"
+            )
+            with patch("saathimart_vendor.tasks._reconcile_item") as mock_reconcile_item:
+                reconcile_stock()  # no force — should be gated out
+                mock_reconcile_item.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@
  "track_changes": 0,
  "fields": [
   {"fieldname": "event_type", "fieldtype": "Select", "label": "Event Type",
-   "options": "stock.receipt\nstock.deduct\nstock.adjustment\nprice.update\norder.confirmed\norder.dispatched\norder.delivered\norder.cancel",
+   "options": "stock.receipt\nstock.deduct\nstock.adjustment\nprice.update\nbarcode.register\nbarcode.unregister\norder.confirmed\norder.preparing\norder.dispatched\norder.delivered\norder.cancel",
    "reqd": 1, "in_list_view": 1},
   {"fieldname": "status", "fieldtype": "Select", "label": "Status",
    "options": "Pending\nSent\nFailed\nDead",

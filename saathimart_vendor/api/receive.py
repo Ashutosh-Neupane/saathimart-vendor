@@ -20,6 +20,28 @@ def _validate_transition(old_status, new_status):
     return True
 
 
+def dispatch_event(event, payload):
+    """
+    Shared handler dispatch — used both by the live webhook
+    (receive_from_hub, below) and by catch-up polling
+    (saathimart_vendor.tasks.catch_up_with_hub). Keeping this in one place
+    means an event replayed via catch-up runs through exactly the same
+    idempotent handler as one delivered live; there's no separate
+    "replay" code path that could drift out of sync with the real one.
+    """
+    handlers = {
+        "order.new":      _handle_new_order,
+        "order.cancel":   _handle_order_cancel,
+        "order.reassign": _handle_order_reassign,
+        "product.new":    _handle_new_product,
+    }
+    handler = handlers.get(event)
+    if handler:
+        handler(payload)
+    else:
+        frappe.log_error(f"Unknown event from hub: {event}", "Vendor Receive")
+
+
 @frappe.whitelist(allow_guest=True)
 def receive_from_hub(event=None, payload=None):
     """Hub pushes events here. Idempotent on all handlers."""
@@ -32,16 +54,7 @@ def receive_from_hub(event=None, payload=None):
         payload = json.loads(payload)
     payload = payload or {}
 
-    handlers = {
-        "order.new":      _handle_new_order,
-        "order.cancel":   _handle_order_cancel,
-        "order.reassign": _handle_order_reassign,
-    }
-    handler = handlers.get(event)
-    if handler:
-        handler(payload)
-    else:
-        frappe.log_error(f"Unknown event from hub: {event}", "Vendor Receive")
+    dispatch_event(event, payload)
 
     frappe.db.commit()
     return {"ok": True}
@@ -193,6 +206,62 @@ def _handle_order_reassign(payload):
     })
 
 
+def _handle_new_product(payload):
+    """
+    Hub announces a newly-created Product. Auto-map it only when this vendor
+    already stocks the exact same physical item — i.e. the barcode matches
+    an existing ERPNext Item Barcode row on this site. This is not a "here's
+    something you could carry" suggestion queue: if there's no match, this
+    is a no-op, on purpose — carrying a product is still entirely the
+    vendor's own decision, made through their own inventory, not something
+    the hub pushes onto them.
+
+    On a match: creates a fully-Mapped Product Mapping (no manual step) and
+    triggers the same auto-create-Vendor-Listing call sync_with_hub() uses,
+    so the vendor's existing barcode data alone is enough to make the
+    product connected end-to-end — price and stock are still whatever the
+    vendor's Item Price / stock ledger already say (or will say once
+    entered), same as any other mapping.
+    """
+    hub_product_id = payload.get("product_id")
+    barcode = payload.get("barcode")
+    if not hub_product_id or not barcode:
+        return
+
+    config = get_config()
+    if not config:
+        return
+
+    if frappe.db.exists("Product Mapping", {"hub_product_id": hub_product_id, "vendor": config.vendor_id}):
+        return  # already known — vendor mapped it some other way already
+
+    item_code = frappe.db.get_value("Item Barcode", {"barcode": barcode}, "parent")
+    if not item_code:
+        return  # vendor doesn't stock this barcode — nothing to do
+
+    mapping = frappe.new_doc("Product Mapping")
+    mapping.barcode = barcode
+    mapping.item_code = item_code
+    mapping.vendor = config.vendor_id
+    mapping.hub_product_id = hub_product_id
+    mapping.hub_sku = barcode
+    mapping.sync_status = "Mapped"
+    mapping.last_synced = now_datetime()
+    try:
+        mapping.insert(ignore_permissions=True)
+    except frappe.ValidationError as e:
+        # Most likely this item_code is already mapped to a *different* hub
+        # product for this vendor — a real conflict for a human to resolve,
+        # not something retrying this same push will ever fix on its own.
+        frappe.log_error(
+            f"Auto-map skipped: {item_code} / {barcode} for vendor {config.vendor_id}: {e}",
+            "Product Auto-Map Conflict",
+        )
+        return
+
+    mapping._auto_create_vendor_listing(None)
+
+
 def _verify_hub_secret():
     config = get_config()
     if not config:
@@ -212,6 +281,7 @@ def _verify_hub_secret():
 
 def _verify_timestamp(max_age_seconds=300):
     """Reject events older than max_age_seconds to prevent replay attacks."""
+    from datetime import datetime, timezone
     ts = frappe.request.headers.get("X-SM-Timestamp")
     if not ts:
         frappe.throw(_("Missing X-SM-Timestamp header"), frappe.AuthenticationError)
@@ -219,7 +289,7 @@ def _verify_timestamp(max_age_seconds=300):
         event_time = float(ts)
     except (TypeError, ValueError):
         frappe.throw(_("Invalid timestamp"), frappe.AuthenticationError)
-    now = now_datetime().timestamp()
+    now = datetime.now(timezone.utc).timestamp()
     if abs(now - event_time) > max_age_seconds:
         frappe.throw(_("Event timestamp too old"), frappe.AuthenticationError)
 

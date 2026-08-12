@@ -31,6 +31,8 @@
    "read_only": 1},
   {"fieldname": "accepted_at", "fieldtype": "Datetime", "label": "Accepted At",
    "read_only": 1},
+  {"fieldname": "preparing_at", "fieldtype": "Datetime", "label": "Preparing At",
+   "read_only": 1},
   {"fieldname": "dispatched_at", "fieldtype": "Datetime", "label": "Dispatched At",
    "read_only": 1},
   {"fieldname": "delivered_at", "fieldtype": "Datetime", "label": "Delivered At",

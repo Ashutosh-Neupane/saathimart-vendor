@@ -2,7 +2,28 @@ import json
 import uuid
 import frappe
 import requests
+from datetime import datetime, timezone
 from frappe.utils import flt
+
+
+def safe_enqueue(*args, **kwargs):
+    """
+    frappe.enqueue(), but never lets a background-job scheduling failure
+    break the caller. Found live (bench run-tests, hub side): frappe.enqueue()
+    itself can raise QueueOverloaded (Frappe's own cap on pending RQ jobs)
+    when nothing is draining the queue fast enough — and every call site
+    here runs synchronously inside a whitelisted vendor action or ERPNext
+    doc_event hook (accept_order, mark_dispatched, an Item save, ...). An
+    uncaught QueueOverloaded there doesn't just skip the instant-delivery
+    optimization, it fails the underlying action itself — e.g. a vendor
+    unable to accept an order because the "sync this to the hub faster"
+    nicety couldn't be scheduled. flush_outbox's cron sweep is the fallback
+    exactly so instant delivery can be allowed to fail silently.
+    """
+    try:
+        frappe.enqueue(*args, **kwargs)
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Instant delivery scheduling failed")
 
 
 def get_config():
@@ -123,6 +144,21 @@ def enqueue_outbox(event_type, payload, voucher_type="", voucher_no=""):
     """
     Write one row to Sync Outbox in the SAME db transaction as the caller.
     Transactional outbox pattern — event is never lost even if hub is down.
+
+    Schedules immediate delivery of just this row (enqueue_after_commit=True
+    defers the actual RQ job until this transaction commits). This used to
+    have an immediate=True/False split with a "batch, don't push yet" path
+    for bulk-ish event types — removed: the batching was an in-memory
+    module-level buffer, which can't work correctly here. Every
+    enqueue_outbox() call can run in a different process (any gunicorn
+    worker handling whatever request/hook triggered it), and a background
+    job scheduled to "flush the buffer later" runs in a *different* process
+    again (an RQ worker) — Python module globals aren't shared across OS
+    processes, so that deferred flush always found an empty buffer and
+    silently did nothing. Real batching for genuine bulk scenarios (many
+    pending rows at once) now happens in flush_outbox()'s cron sweep
+    instead, which reads the actually-durable Sync Outbox table rather than
+    in-memory state — see its docstring.
     """
     doc = frappe.new_doc("Sync Outbox")
     doc.event_type = event_type
@@ -132,6 +168,15 @@ def enqueue_outbox(event_type, payload, voucher_type="", voucher_no=""):
     doc.voucher_no = voucher_no
     doc.insert(ignore_permissions=True)
     # intentionally no frappe.db.commit() here — caller's transaction covers this
+
+    safe_enqueue(
+        "saathimart_vendor.tasks._push_one_now",
+        row_name=doc.name,
+        queue="default",
+        enqueue_after_commit=True,
+        job_id=f"push-sync-outbox-{doc.name}",
+        deduplicate=True,
+    )
 
 
 def hub_get(config, method, params=None):
@@ -178,6 +223,7 @@ def hub_headers(config):
     headers = {
         "X-SM-Secret": secret,
         "X-Vendor-ID": config.vendor_id,
+        "X-SM-Timestamp": str(int(datetime.now(timezone.utc).timestamp())),
         "Content-Type": "application/json",
     }
     # hub_url is often a Docker service name (e.g. http://hub:8000), which

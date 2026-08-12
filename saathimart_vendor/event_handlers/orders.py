@@ -60,6 +60,14 @@ def on_sales_order_cancel(doc, method):
 
 
 def on_delivery_note_submit(doc, method):
+    if frappe.flags.get("in_vendor_order_dispatch"):
+        # VendorOrder.mark_dispatched() is submitting this Delivery Note
+        # itself and will set status + enqueue order.dispatched on its own
+        # once the submit succeeds — skip to avoid a duplicate event. (The
+        # status-based guard below doesn't cover this case: at the moment
+        # this hook fires, mark_dispatched() hasn't set status="Dispatched"
+        # yet — that happens after dn.submit() returns.)
+        return
     so_name = None
     for item in doc.items:
         if getattr(item, "against_sales_order", None):

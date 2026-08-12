@@ -242,17 +242,21 @@ done
 # would (and used to) try to sync not-yet-created later sites too early.
 echo "Syncing vendor locations to hub..."
 for SITE in $VENDOR_SITES; do
-  cd "$BENCH" && "$BENCH/env/bin/python" - "$SITE" <<'PYEOF'
+  cd "$BENCH/sites" && "$BENCH/env/bin/python" - "$SITE" <<'PYEOF'
 import sys
-import frappe
 site = sys.argv[1]
-frappe.init(site, sites_path='/home/frappe/bench/sites')
-frappe.connect()
-from saathimart_vendor.api.mapping import sync_vendor_location
 try:
+    import frappe
+    frappe.init(site, sites_path='/home/frappe/bench/sites')
+    frappe.connect()
+    from saathimart_vendor.api.mapping import sync_vendor_location
     result = sync_vendor_location()
     print(f'  Location synced for {site}: {result}')
 except Exception as e:
+    # Provisioning best-effort: one site's sync failing (or the hub being
+    # briefly unreachable) must never take down container startup — this
+    # already happened once when a CWD bug here made frappe.connect() raise
+    # and, under init.sh's `set -e`, killed the whole container in a loop.
     print(f'  Location sync failed for {site}: {e}')
 PYEOF
 done
@@ -269,9 +273,17 @@ import frappe.app
 application = frappe.app.application_with_statics()
 EOF
 
-# Create Procfile for bench start with full gunicorn path
+# Create Procfile for bench start with full gunicorn path.
+#
+# web-only was silently dropping the entire async side of this app — same
+# issue as the hub's docker/init.sh (see its comment here for the full
+# story): confirmed live via `bench doctor`, Workers online: 0, scheduler
+# disabled on at least one of the three vendor sites, hundreds of jobs
+# queued and never processed after days of web-only operation.
 cat > "$BENCH/Procfile" <<'EOF'
 web: cd /home/frappe/bench/sites && /home/frappe/bench/env/bin/gunicorn --bind 0.0.0.0:8000 gunicorn_wsgi:application
+worker: cd /home/frappe/bench/sites && /usr/local/bin/bench worker --queue short,default,long
+schedule: cd /home/frappe/bench/sites && /usr/local/bin/bench schedule
 EOF
 
 echo "=== Starting vendor sites on port $PORT ==="
