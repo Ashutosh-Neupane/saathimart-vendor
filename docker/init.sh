@@ -230,6 +230,21 @@ else:
 
     config.default_warehouse = f'Stores - {abbr}'
 
+# Unconditional (outside the existing_warehouse branch above) — a site that
+# already had a warehouse from somewhere else skips the whole Company/
+# currency bootstrap block, which is exactly how one of these three vendor
+# sites ended up still on Frappe's factory-default USD/$ while the other two
+# were fine. Same root cause and fix as saathimart/docker/init.sh's hub-side
+# currency setup.
+if frappe.db.exists('Currency', 'NPR') and not frappe.db.get_value('Currency', 'NPR', 'enabled'):
+    frappe.db.set_value('Currency', 'NPR', 'enabled', 1)
+# frappe.db.set_value (not get_single().save()) — System Settings has other
+# mandatory fields (language, time_zone) a site with no Setup Wizard run
+# never had filled in, so a normal .save() throws MandatoryError even though
+# currency is the only field actually being touched here.
+if frappe.db.get_value('System Settings', 'System Settings', 'currency') != 'NPR':
+    frappe.db.set_value('System Settings', 'System Settings', 'currency', 'NPR')
+
 config.save(ignore_permissions=True)
 frappe.db.commit()
 print(f'  Vendor Config saved for {vendor_id}')
