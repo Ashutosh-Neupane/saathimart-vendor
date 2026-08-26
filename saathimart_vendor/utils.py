@@ -140,6 +140,65 @@ def _get_base_qty(item_code):
     return flt(actual) + flt(reserved)
 
 
+def create_payment_entry_for_order(vendor_order, reference_no="", paid_amount=None):
+    """
+    Create + submit a real ERPNext Payment Entry against the vendor order's
+    submitted Sales Order, so money the hub actually collected (eSewa) shows
+    up in the vendor's own books — Accounts Receivable cleared, bank/cash
+    debited — instead of the sale staying perpetually uncollected on paper.
+
+    Idempotent: a second call for an order that already has a Payment Entry
+    is a no-op. Failures are logged, never raised — a missing/misconfigured
+    chart of accounts on the vendor site must not block order acceptance or
+    event processing; the entry can be created by hand later.
+
+    Returns the Payment Entry name, or None when nothing was created.
+    """
+    if not vendor_order.sales_order:
+        return None
+    if getattr(vendor_order, "payment_entry", None):
+        return vendor_order.payment_entry
+
+    # get_payment_entry() builds allocations against a *submitted* document;
+    # a draft SO has nothing outstanding to allocate yet.
+    so_docstatus = frappe.db.get_value("Sales Order", vendor_order.sales_order, "docstatus")
+    if so_docstatus != 1:
+        return None
+
+    try:
+        from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
+
+        pe = get_payment_entry("Sales Order", vendor_order.sales_order)
+        pe.reference_no = reference_no or f"HUB-{vendor_order.hub_order_id}"
+        pe.reference_date = frappe.utils.today()
+
+        # The hub sends this vendor's slice of what was collected. Trust it
+        # only when it's present and sane — otherwise keep the SO-outstanding
+        # amounts get_payment_entry already computed.
+        amount = flt(paid_amount) if paid_amount is not None else 0
+        if amount > 0:
+            pe.paid_amount = amount
+            pe.received_amount = amount
+            for ref in (pe.references or []):
+                ref.allocated_amount = amount
+
+        pe.insert(ignore_permissions=True)
+        pe.submit()
+
+        frappe.db.set_value("Vendor Order", vendor_order.name, {
+            "payment_status": "Paid",
+            "paid_at": frappe.utils.now_datetime(),
+            "payment_entry": pe.name,
+        })
+        return pe.name
+    except Exception:
+        frappe.log_error(
+            frappe.get_traceback(),
+            f"Payment Entry failed for hub order {vendor_order.hub_order_id}",
+        )
+        return None
+
+
 def enqueue_outbox(event_type, payload, voucher_type="", voucher_no=""):
     """
     Write one row to Sync Outbox in the SAME db transaction as the caller.

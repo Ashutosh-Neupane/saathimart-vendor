@@ -30,10 +30,11 @@ def dispatch_event(event, payload):
     "replay" code path that could drift out of sync with the real one.
     """
     handlers = {
-        "order.new":      _handle_new_order,
-        "order.cancel":   _handle_order_cancel,
-        "order.reassign": _handle_order_reassign,
-        "product.new":    _handle_new_product,
+        "order.new":        _handle_new_order,
+        "order.cancel":     _handle_order_cancel,
+        "order.reassign":   _handle_order_reassign,
+        "product.new":      _handle_new_product,
+        "payment.received": _handle_payment_received,
     }
     handler = handlers.get(event)
     if handler:
@@ -260,6 +261,45 @@ def _handle_new_product(payload):
         return
 
     mapping._auto_create_vendor_listing(None)
+
+
+def _handle_payment_received(payload):
+    """
+    Hub confirmed the customer paid (eSewa callback / status poll / admin
+    application). Record it: flip Vendor Order payment_status to Paid —
+    which unblocks accept_order() for prepaid orders, previously stuck at
+    "Received" forever because nothing ever told us the money arrived — and
+    create a real ERPNext Payment Entry against the linked Sales Order.
+
+    Idempotent on both the status flip and the Payment Entry.
+    """
+    from saathimart_vendor.utils import create_payment_entry_for_order
+
+    hub_order_id = payload.get("order_id")
+    if not hub_order_id:
+        frappe.log_error("payment.received missing order_id", "Vendor Receive")
+        return
+
+    if not frappe.db.exists("Vendor Order", hub_order_id):
+        # order.new hasn't been processed yet (delivery can race under
+        # retries). Failing loudly makes the webhook return non-ok so the
+        # hub's event queue retries after the order exists.
+        frappe.throw(_(f"Vendor Order {hub_order_id} not found yet"))
+
+    doc = frappe.get_doc("Vendor Order", hub_order_id)
+    if doc.payment_status == "Paid" and doc.payment_entry:
+        return  # already recorded — replayed event
+
+    doc.payment_status = "Paid"
+    doc.payment_method = payload.get("gateway") or doc.payment_method
+    doc.payment_reference = payload.get("reference") or doc.payment_reference or ""
+    doc.save(ignore_permissions=True)
+
+    create_payment_entry_for_order(
+        doc,
+        reference_no=payload.get("reference") or "",
+        paid_amount=payload.get("amount"),
+    )
 
 
 def _verify_hub_secret():

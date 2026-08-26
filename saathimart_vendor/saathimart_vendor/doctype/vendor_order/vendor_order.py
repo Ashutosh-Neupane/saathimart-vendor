@@ -2,7 +2,7 @@ import json
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from saathimart_vendor.utils import enqueue_outbox, get_config, generate_event_id, next_event_seq, VALID_TRANSITIONS
+from saathimart_vendor.utils import enqueue_outbox, get_config, generate_event_id, next_event_seq, VALID_TRANSITIONS, create_payment_entry_for_order
 
 
 class VendorOrder(Document):
@@ -71,6 +71,13 @@ class VendorOrder(Document):
         self.status = "Accepted"
         self.accepted_at = frappe.utils.now_datetime()
         self.save(ignore_permissions=True)
+
+        # Prepaid order (eSewa) accepted after the hub's payment.received
+        # event flipped payment_status — the money is real, so record it as
+        # a Payment Entry against this fresh Sales Order right now instead
+        # of leaving the receivable open on the books.
+        if self.payment_status == "Paid" and not self.payment_entry:
+            create_payment_entry_for_order(self, reference_no=self.payment_reference or "")
 
         enqueue_outbox(
             event_type="order.confirmed",
