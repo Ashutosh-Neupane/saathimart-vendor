@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import json
 import uuid
 import frappe
@@ -260,10 +262,11 @@ def hub_get(config, method, params=None):
 def hub_post(config, method, payload):
     """POST request to hub API. Returns (ok, message_or_error)."""
     try:
+        body = json.dumps(payload)
         resp = requests.post(
             f"{config.hub_url}/api/method/{method}",
-            json=payload,
-            headers=hub_headers(config),
+            data=body,
+            headers=hub_headers(config, body=body),
             timeout=10,
         )
         if resp.ok:
@@ -273,18 +276,34 @@ def hub_post(config, method, payload):
         return False, str(e)[:300]
 
 
-def hub_headers(config):
+def compute_hmac_signature(secret, timestamp, body):
+    """
+    Stripe-style request signature: HMAC-SHA256 over "<timestamp>.<body>"
+    keyed with the shared webhook secret. Mirrors the hub's helper so both
+    sides sign and verify identically. The secret never crosses the wire.
+    """
+    msg = f"{timestamp}.".encode() + (body if isinstance(body, bytes) else body.encode())
+    return hmac.new(secret.encode(), msg, hashlib.sha256).hexdigest()
+
+
+def hub_headers(config, body=""):
     secret = ""
     try:
         secret = config.get_password("webhook_secret", raise_exception=False) or ""
     except Exception:
         pass
+    ts = str(int(datetime.now(timezone.utc).timestamp()))
     headers = {
         "X-SM-Secret": secret,
         "X-Vendor-ID": config.vendor_id,
-        "X-SM-Timestamp": str(int(datetime.now(timezone.utc).timestamp())),
+        "X-SM-Timestamp": ts,
         "Content-Type": "application/json",
     }
+    # Sign the exact body being sent (empty for GETs). The hub prefers this
+    # over the bare-secret header; X-SM-Secret is kept during the rolling
+    # upgrade and can be dropped once the hub requires signatures.
+    if secret:
+        headers["X-SM-Signature"] = compute_hmac_signature(secret, ts, body)
     # hub_url is often a Docker service name (e.g. http://hub:8000), which
     # is not itself a valid Frappe site — an explicit Host header is what
     # routes the request to the right site on a multi-tenant hub bench.

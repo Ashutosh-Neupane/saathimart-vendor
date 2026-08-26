@@ -313,6 +313,23 @@ def _verify_hub_secret():
         pass
     if not secret:
         frappe.throw(_("Webhook secret not configured"), frappe.AuthenticationError)
+
+    # Preferred: HMAC signature over "<timestamp>.<raw_body>" — the secret
+    # never crosses the wire, so a captured request can't be replayed into a
+    # valid credential. Legacy fallback: bare X-SM-Secret compare, kept for
+    # hubs on the pre-HMAC build; delete once every hub sends signatures.
+    from saathimart_vendor.utils import compute_hmac_signature
+
+    signature = frappe.request.headers.get("X-SM-Signature", "")
+    if signature:
+        ts = frappe.request.headers.get("X-SM-Timestamp", "")
+        raw_body = frappe.request.get_data(cache=True, as_text=False) or b""
+        computed = compute_hmac_signature(secret, ts, raw_body)
+        if not hmac.compare_digest(signature.strip(), computed):
+            _log_auth_failure("receive_from_hub", "invalid_signature")
+            frappe.throw(_("Invalid webhook signature"), frappe.AuthenticationError)
+        return
+
     incoming = frappe.request.headers.get("X-SM-Secret", "")
     if not hmac.compare_digest(incoming, secret):
         _log_auth_failure("receive_from_hub", "invalid_secret")
