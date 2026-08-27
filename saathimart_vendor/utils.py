@@ -294,14 +294,12 @@ def hub_headers(config, body=""):
         pass
     ts = str(int(datetime.now(timezone.utc).timestamp()))
     headers = {
-        "X-SM-Secret": secret,
         "X-Vendor-ID": config.vendor_id,
         "X-SM-Timestamp": ts,
         "Content-Type": "application/json",
     }
-    # Sign the exact body being sent (empty for GETs). The hub prefers this
-    # over the bare-secret header; X-SM-Secret is kept during the rolling
-    # upgrade and can be dropped once the hub requires signatures.
+    # HMAC-SHA256 signature over "<timestamp>.<body>" — the secret never
+    # crosses the wire. Legacy bare X-SM-Secret header removed.
     if secret:
         headers["X-SM-Signature"] = compute_hmac_signature(secret, ts, body)
     # hub_url is often a Docker service name (e.g. http://hub:8000), which

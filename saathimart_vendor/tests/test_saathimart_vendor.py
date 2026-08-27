@@ -1102,10 +1102,10 @@ class TestHubAuthHmac(unittest.TestCase):
     def test_valid_signature_accepted(self):
         self._verify_with_request(self._headers(self.PRIMARY))
 
-    def test_legacy_secret_header_still_accepted(self):
-        # Rolling-upgrade fallback: hubs on the pre-HMAC build send the bare
-        # secret; must keep working until every hub signs.
-        self._verify_with_request({"X-SM-Secret": self.PRIMARY})
+    def test_missing_signature_rejected(self):
+        # No X-SM-Signature header → must reject (legacy bare-secret removed)
+        with self.assertRaises(frappe.AuthenticationError):
+            self._verify_with_request({"X-SM-Timestamp": "1700000000"})
 
     # ── attack scenarios ──
 

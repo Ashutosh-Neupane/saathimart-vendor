@@ -344,12 +344,10 @@ def _verify_hub_secret():
         _log_auth_failure("receive_from_hub", "invalid_signature")
         frappe.throw(_("Invalid webhook signature"), frappe.AuthenticationError)
 
-    incoming = frappe.request.headers.get("X-SM-Secret", "")
-    if not incoming or not any(
-        hmac.compare_digest(incoming, s) for s in accepted
-    ):
-        _log_auth_failure("receive_from_hub", "invalid_secret")
-        frappe.throw(_("Invalid webhook secret"), frappe.AuthenticationError)
+    # No signature header → reject. The legacy bare X-SM-Secret fallback
+    # was removed: all callers now send HMAC signatures.
+    _log_auth_failure("receive_from_hub", "missing_signature")
+    frappe.throw(_("Missing webhook signature"), frappe.AuthenticationError)
 
 
 def _verify_timestamp(max_age_seconds=300):
