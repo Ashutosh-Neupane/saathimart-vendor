@@ -1,0 +1,68 @@
+{
+  "name": "Vendor Warehouse",
+  "module": "Saathimart Vendor",
+  "doctype": "DocType",
+  "istable": 1,
+  "fields": [
+    {
+      "fieldname": "warehouse_name",
+      "fieldtype": "Data",
+      "label": "Warehouse Name",
+      "reqd": 1,
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "erpnext_warehouse",
+      "fieldtype": "Link",
+      "label": "ERPNext Warehouse",
+      "options": "Warehouse",
+      "description": "Map this warehouse entry to an ERPNext Warehouse on this site",
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "col_break_1",
+      "fieldtype": "Column Break"
+    },
+    {
+      "fieldname": "lat",
+      "fieldtype": "Float",
+      "label": "Latitude"
+    },
+    {
+      "fieldname": "lng",
+      "fieldtype": "Float",
+      "label": "Longitude"
+    },
+    {
+      "fieldname": "col_break_2",
+      "fieldtype": "Column Break"
+    },
+    {
+      "fieldname": "is_default",
+      "fieldtype": "Check",
+      "label": "Default Warehouse"
+    },
+    {
+      "fieldname": "priority",
+      "fieldtype": "Int",
+      "label": "Priority",
+      "default": "1"
+    },
+    {
+      "fieldname": "status",
+      "fieldtype": "Select",
+      "label": "Status",
+      "options": "Active\nInactive",
+      "default": "Active",
+      "in_list_view": 1
+    }
+  ],
+  "permissions": [
+    {
+      "role": "System Manager",
+      "read": 1,
+      "write": 1,
+      "create": 1
+    }
+  ]
+}

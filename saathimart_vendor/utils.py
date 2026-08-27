@@ -106,11 +106,13 @@ def next_event_seq():
     return seq
 
 
-def build_stock_payload(mapping, qty_change, voucher_type, voucher_no, source_site, remarks, base_qty=None):
+def build_stock_payload(mapping, qty_change, voucher_type, voucher_no, source_site, remarks, base_qty=None, warehouse=None):
     """
     Build a stock event payload with idempotency and ordering fields.
     base_qty is the expected total qty (available + reserved) at push time,
     used by the hub as a staleness guard.
+    warehouse is the ERPNext warehouse name — included so the hub can track
+    stock per location for multi-warehouse vendors.
     """
     payload = {
         "barcode": mapping.barcode,
@@ -125,19 +127,25 @@ def build_stock_payload(mapping, qty_change, voucher_type, voucher_no, source_si
     }
     if base_qty is not None:
         payload["base_qty"] = flt(base_qty)
+    if warehouse:
+        payload["warehouse"] = warehouse
     return payload
 
 
-def _get_base_qty(item_code):
-    """Return available + reserved qty from ERPNext Bin for staleness guard."""
+def _get_base_qty(item_code, warehouse=None):
+    """Return available + reserved qty from ERPNext Bin for staleness guard.
+    If warehouse is specified, queries that specific warehouse; otherwise uses
+    the default warehouse from Vendor Config.
+    """
     config = get_config()
-    if not config or not config.default_warehouse:
+    wh = warehouse or (config.default_warehouse if config else None)
+    if not wh:
         return None
     actual = frappe.db.get_value(
-        "Bin", {"item_code": item_code, "warehouse": config.default_warehouse}, "actual_qty"
+        "Bin", {"item_code": item_code, "warehouse": wh}, "actual_qty"
     ) or 0
     reserved = frappe.db.get_value(
-        "Bin", {"item_code": item_code, "warehouse": config.default_warehouse}, "reserved_qty"
+        "Bin", {"item_code": item_code, "warehouse": wh}, "reserved_qty"
     ) or 0
     return flt(actual) + flt(reserved)
 

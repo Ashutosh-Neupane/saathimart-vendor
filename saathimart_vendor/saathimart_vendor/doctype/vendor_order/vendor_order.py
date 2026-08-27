@@ -30,6 +30,20 @@ class VendorOrder(Document):
         if not self.items:
             frappe.throw(_("Order has no items"))
 
+        # Resolve the fulfillment warehouse: use the hub-assigned warehouse
+        # if present, otherwise fall back to the vendor's default.
+        fulfillment_warehouse = self.warehouse or config.default_warehouse
+        if self.warehouse and not self.erpnext_warehouse:
+            # Look up the ERPNext warehouse name from our warehouse table
+            wh_row = None
+            for wh in (config.warehouses or []):
+                if wh.warehouse_name == self.warehouse and wh.erpnext_warehouse:
+                    wh_row = wh
+                    break
+            if wh_row:
+                self.erpnext_warehouse = wh_row.erpnext_warehouse
+                fulfillment_warehouse = wh_row.erpnext_warehouse
+
         so = frappe.new_doc("Sales Order")
         so.customer = _get_or_create_customer(self.customer_name, self.customer_phone)
         so.delivery_date = frappe.utils.add_days(frappe.utils.today(), 1)
@@ -48,7 +62,7 @@ class VendorOrder(Document):
                 "item_code": mapping.item_code,
                 "qty": item.qty,
                 "rate": item.rate,
-                "warehouse": config.default_warehouse,
+                "warehouse": fulfillment_warehouse,
             })
         # Price List / currency / exchange rate aren't set anywhere above —
         # normally the desk UI's client script fills these in as items are

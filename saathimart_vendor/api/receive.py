@@ -86,6 +86,12 @@ def _handle_new_order(payload):
     doc.payment_status   = payload.get("payment_status", "Unpaid")
     doc.received_at      = frappe.utils.now_datetime()
 
+    # Warehouse routing: hub tells us which warehouse to fulfill from
+    hub_warehouse = payload.get("warehouse", "")
+    if hub_warehouse:
+        doc.warehouse = hub_warehouse
+        doc.warehouse_distance_km = payload.get("warehouse_distance_km", 0) or 0
+
     for item in (payload.get("items") or []):
         product_id  = item.get("product", "")
         qty         = item.get("qty", 1)

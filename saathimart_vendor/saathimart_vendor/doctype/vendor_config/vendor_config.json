@@ -110,6 +110,24 @@
    "label": "Warehouse"
   },
   {
+   "fieldname": "warehouses",
+   "fieldtype": "Table",
+   "label": "Warehouses",
+   "description": "Multi-location warehouses synced from the hub. Each maps to an ERPNext Warehouse on this site.",
+   "options": "Vendor Warehouse"
+  },
+  {
+   "fieldname": "col_break_wh_cfg",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "warehouse_synced_at",
+   "fieldtype": "Datetime",
+   "label": "Warehouse Synced At",
+   "read_only": 1,
+   "description": "When warehouses were last synced from the hub"
+  },
+  {
    "fieldname": "default_warehouse",
    "fieldtype": "Link",
    "label": "Default Warehouse",
