@@ -333,10 +333,14 @@ def _verify_hub_secret():
     if not accepted:
         frappe.throw(_("Webhook secret not configured"), frappe.AuthenticationError)
 
-    # Preferred: HMAC signature over "<timestamp>.<raw_body>" — the secret
-    # never crosses the wire, so a captured request can't be replayed into a
-    # valid credential. Legacy fallback: bare X-SM-Secret compare, kept for
-    # hubs on the pre-HMAC build; delete once every hub sends signatures.
+    # HMAC signature verification with rate limiting
+    from saathimart_vendor.rate_limiter import check_rate_limit, record_failure, clear_failures
+    client_ip = frappe.request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or \
+                frappe.request.headers.get("X-Real-IP", "") or \
+                getattr(frappe.request, "ip", "unknown") or "unknown"
+    if not check_rate_limit(client_ip):
+        frappe.throw(_("Too many failed attempts. Try again later."), frappe.AuthenticationError)
+
     from saathimart_vendor.utils import compute_hmac_signature
 
     signature = frappe.request.headers.get("X-SM-Signature", "")
@@ -346,12 +350,14 @@ def _verify_hub_secret():
         sig = signature.strip()
         for cand in accepted:
             if hmac.compare_digest(sig, compute_hmac_signature(cand, ts, raw_body)):
+                clear_failures(client_ip)
                 return
+        record_failure(client_ip)
         _log_auth_failure("receive_from_hub", "invalid_signature")
         frappe.throw(_("Invalid webhook signature"), frappe.AuthenticationError)
 
-    # No signature header → reject. The legacy bare X-SM-Secret fallback
-    # was removed: all callers now send HMAC signatures.
+    # No signature header → reject.
+    record_failure(client_ip)
     _log_auth_failure("receive_from_hub", "missing_signature")
     frappe.throw(_("Missing webhook signature"), frappe.AuthenticationError)
 
