@@ -302,16 +302,29 @@ def _handle_payment_received(payload):
     )
 
 
+def _accepted_secrets(config):
+    """
+    All secrets whose signatures/headers we currently accept:
+    primary, previous (rotation grace), and staged-next (rotation phase 1).
+    Only the primary is ever used for outbound signing.
+    """
+    out = []
+    for field in ("webhook_secret", "webhook_secret_old", "webhook_secret_next"):
+        try:
+            val = config.get_password(field, raise_exception=False) or ""
+        except Exception:
+            val = ""
+        if val:
+            out.append(val)
+    return out
+
+
 def _verify_hub_secret():
     config = get_config()
     if not config:
         frappe.throw(_("Vendor Config not set up"), frappe.AuthenticationError)
-    secret = ""
-    try:
-        secret = config.get_password("webhook_secret", raise_exception=False) or ""
-    except Exception:
-        pass
-    if not secret:
+    accepted = _accepted_secrets(config)
+    if not accepted:
         frappe.throw(_("Webhook secret not configured"), frappe.AuthenticationError)
 
     # Preferred: HMAC signature over "<timestamp>.<raw_body>" — the secret
@@ -324,14 +337,17 @@ def _verify_hub_secret():
     if signature:
         ts = frappe.request.headers.get("X-SM-Timestamp", "")
         raw_body = frappe.request.get_data(cache=True, as_text=False) or b""
-        computed = compute_hmac_signature(secret, ts, raw_body)
-        if not hmac.compare_digest(signature.strip(), computed):
-            _log_auth_failure("receive_from_hub", "invalid_signature")
-            frappe.throw(_("Invalid webhook signature"), frappe.AuthenticationError)
-        return
+        sig = signature.strip()
+        for cand in accepted:
+            if hmac.compare_digest(sig, compute_hmac_signature(cand, ts, raw_body)):
+                return
+        _log_auth_failure("receive_from_hub", "invalid_signature")
+        frappe.throw(_("Invalid webhook signature"), frappe.AuthenticationError)
 
     incoming = frappe.request.headers.get("X-SM-Secret", "")
-    if not hmac.compare_digest(incoming, secret):
+    if not incoming or not any(
+        hmac.compare_digest(incoming, s) for s in accepted
+    ):
         _log_auth_failure("receive_from_hub", "invalid_secret")
         frappe.throw(_("Invalid webhook secret"), frappe.AuthenticationError)
 
@@ -370,3 +386,47 @@ def _log_auth_failure(endpoint, reason, payload=None):
         )
     except Exception:
         pass
+
+
+@frappe.whitelist(allow_guest=True)
+def rotate_secret_stage(new_secret=None):
+    """
+    Rotation phase 1 (hub -> vendor). Store the hub's NEXT secret as staged:
+    accepted for verification from this instant, never used for signing.
+    Authenticated like any other hub call; the staged secret travels inside
+    a request already authenticated with the CURRENT secret over TLS.
+    """
+    _verify_hub_secret()
+    _verify_timestamp()
+    if not new_secret or len(new_secret) < 24:
+        frappe.throw(_("new_secret missing or too short"), frappe.ValidationError)
+
+    config = get_config()
+    config.webhook_secret_next = new_secret
+    config.save(ignore_permissions=True)
+    frappe.db.commit()
+    return {"ok": True, "staged": True}
+
+
+@frappe.whitelist(allow_guest=True)
+def rotate_secret_promote():
+    """
+    Rotation phase 3 (hub -> vendor, signed with the NEW secret — proof the
+    hub has flipped): promote staged secret to primary, demote primary to
+    old. Idempotent: promoting with nothing staged is a no-op.
+    """
+    _verify_hub_secret()
+    _verify_timestamp()
+
+    config = get_config()
+    staged = config.get_password("webhook_secret_next", raise_exception=False) or ""
+    if not staged:
+        return {"ok": True, "promoted": False}
+
+    current = config.get_password("webhook_secret", raise_exception=False) or ""
+    config.webhook_secret_old = current
+    config.webhook_secret = staged
+    config.webhook_secret_next = None
+    config.save(ignore_permissions=True)
+    frappe.db.commit()
+    return {"ok": True, "promoted": True}

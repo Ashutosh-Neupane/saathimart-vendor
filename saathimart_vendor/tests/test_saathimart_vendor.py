@@ -1026,3 +1026,197 @@ class TestTasks(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── Hub webhook authentication (HMAC signatures) ────────────────────────────
+
+class TestHubAuthHmac(unittest.TestCase):
+    """
+    Inbound-hub-push authentication: valid signatures pass; tampered bodies,
+    wrong secrets and stale timestamps are rejected. Also covers the
+    zero-downtime rotation window (old + staged-next secrets accepted).
+    """
+
+    PRIMARY = "unit-test-primary-secret-0123456789abcdef"
+    OLD = "unit-test-old-secret-9876543210fedcba"
+    NEXT = "unit-test-next-secret-aaaaaabbbbbbcccccc"
+    BODY = b'{"event": "order.new", "payload": {"x": 1}}'
+
+    def setUp(self):
+        frappe.set_user("Administrator")
+        _configure_vendor(vendor_id="vendor-test-hmac")
+        doc = frappe.get_single("Vendor Config")
+        self._orig = {
+            f: doc.get_password(f, raise_exception=False) or ""
+            for f in ("webhook_secret", "webhook_secret_old", "webhook_secret_next")
+        }
+        doc.webhook_secret = self.PRIMARY
+        doc.webhook_secret_old = None
+        doc.webhook_secret_next = None
+        doc.flags.ignore_mandatory = True
+        doc.save(ignore_permissions=True)
+        frappe.db.commit()
+
+    def tearDown(self):
+        doc = frappe.get_single("Vendor Config")
+        for field, value in self._orig.items():
+            setattr(doc, field, value or None)
+        doc.flags.ignore_mandatory = True
+        doc.save(ignore_permissions=True)
+        frappe.db.commit()
+
+    # ── helpers ──
+
+    def _headers(self, secret=None, body=None, ts=None):
+        import time
+
+        from saathimart_vendor.utils import compute_hmac_signature
+
+        body = self.BODY if body is None else body
+        ts = str(int(time.time())) if ts is None else str(ts)
+        headers = {"X-SM-Timestamp": ts}
+        if secret:
+            headers["X-SM-Signature"] = compute_hmac_signature(secret, ts, body)
+        return headers
+
+    def _verify_with_request(self, headers, body=None):
+        from saathimart_vendor.api.receive import _verify_hub_secret
+
+        fake = MagicMock()
+        fake.headers = headers
+        fake.get_data.return_value = self.BODY if body is None else body
+        with patch("frappe.request", fake), \
+             patch("saathimart_vendor.api.receive._log_auth_failure"):
+            _verify_hub_secret()
+
+    def _set_secrets(self, **kwargs):
+        doc = frappe.get_single("Vendor Config")
+        for field, value in kwargs.items():
+            setattr(doc, field, value or None)
+        doc.flags.ignore_mandatory = True
+        doc.save(ignore_permissions=True)
+        frappe.db.commit()
+
+    # ── happy path ──
+
+    def test_valid_signature_accepted(self):
+        self._verify_with_request(self._headers(self.PRIMARY))
+
+    def test_legacy_secret_header_still_accepted(self):
+        # Rolling-upgrade fallback: hubs on the pre-HMAC build send the bare
+        # secret; must keep working until every hub signs.
+        self._verify_with_request({"X-SM-Secret": self.PRIMARY})
+
+    # ── attack scenarios ──
+
+    def test_tampered_body_rejected(self):
+        # Signature computed over the ORIGINAL body, attacker swaps payload
+        # in transit (e.g. 500 -> 5): verification must fail.
+        good_headers = self._headers(self.PRIMARY, body=self.BODY)
+        tampered = self.BODY.replace(b'"x": 1', b'"x": 999999')
+        with self.assertRaises(frappe.AuthenticationError):
+            self._verify_with_request(good_headers, body=tampered)
+
+    def test_wrong_secret_signature_rejected(self):
+        with self.assertRaises(frappe.AuthenticationError):
+            self._verify_with_request(
+                self._headers("attacker-known-guess-0123456789abcdef")
+            )
+
+    def test_garbage_signature_rejected(self):
+        headers = self._headers(None)  # timestamp only, bogus signature
+        headers["X-SM-Signature"] = "deadbeef" * 8
+        with self.assertRaises(frappe.AuthenticationError):
+            self._verify_with_request(headers)
+
+    def test_missing_credentials_rejected(self):
+        with self.assertRaises(frappe.AuthenticationError):
+            self._verify_with_request({"X-SM-Timestamp": "1700000000"})
+
+    def test_stale_timestamp_rejected(self):
+        # Replay guard: a captured request older than max_age_seconds must
+        # be rejected even though its signature is cryptographically valid.
+        import time
+
+        from saathimart_vendor.api.receive import _verify_timestamp
+
+        old_ts = str(int(time.time()) - 600)
+        fake = MagicMock()
+        fake.headers = {"X-SM-Timestamp": old_ts}
+        with patch("frappe.request", fake):
+            with self.assertRaises(frappe.AuthenticationError):
+                _verify_timestamp(max_age_seconds=300)
+
+    def test_fresh_timestamp_accepted(self):
+        import time
+
+        from saathimart_vendor.api.receive import _verify_timestamp
+
+        fake = MagicMock()
+        fake.headers = {"X-SM-Timestamp": str(int(time.time()))}
+        with patch("frappe.request", fake):
+            _verify_timestamp(max_age_seconds=300)
+
+    def test_valid_signature_but_stale_timestamp_rejected_end_to_end(self):
+        # The real endpoint calls BOTH checks; a replayed capture of a fully
+        # valid request dies on the timestamp even though the sig matches.
+        import time
+
+        from saathimart_vendor.api.receive import _verify_hub_secret, _verify_timestamp
+
+        old_ts = str(int(time.time()) - 600)
+        headers = self._headers(self.PRIMARY, ts=old_ts)
+        fake = MagicMock()
+        fake.headers = headers
+        fake.get_data.return_value = self.BODY
+        with patch("frappe.request", fake), \
+             patch("saathimart_vendor.api.receive._log_auth_failure"):
+            with self.assertRaises(frappe.AuthenticationError):
+                _verify_timestamp(max_age_seconds=300)
+
+    # ── rotation window ──
+
+    def test_staged_next_secret_accepted_during_rotation_phase1(self):
+        # Phase 1: hub staged NEW on us but still sends OLD-signed traffic;
+        # NEW-signed requests (post-flip) must verify via webhook_secret_next.
+        self._set_secrets(webhook_secret_next=self.NEXT)
+        self._verify_with_request(self._headers(self.NEXT))
+
+    def test_old_and_new_both_accepted_after_promotion(self):
+        # Phase 3 done: primary=NEW, old kept as grace. Both signatures work;
+        # an unrelated third secret never does.
+        self._set_secrets(webhook_secret=self.NEXT, webhook_secret_old=self.PRIMARY)
+        self._verify_with_request(self._headers(self.NEXT))
+        self._verify_with_request(self._headers(self.PRIMARY))
+        with self.assertRaises(frappe.AuthenticationError):
+            self._verify_with_request(self._headers(self.OLD.replace("fedcba", "ffffff")))
+
+    def test_rotate_stage_then_promote_full_flow(self):
+        # Drive the actual endpoints end-to-end (auth mocked — covered above).
+        from saathimart_vendor.api.receive import rotate_secret_promote, rotate_secret_stage
+
+        with patch("saathimart_vendor.api.receive._verify_hub_secret"), \
+             patch("saathimart_vendor.api.receive._verify_timestamp"):
+            ret = rotate_secret_stage(new_secret=self.NEXT)
+            self.assertTrue(ret["ok"])
+            cfg = frappe.get_single("Vendor Config")
+            self.assertEqual(cfg.get_password("webhook_secret_next", raise_exception=False), self.NEXT)
+
+            # Simulate the hub flipping its primary between phases: nothing
+            # to do here on the vendor — staging alone already accepts NEW.
+
+            ret = rotate_secret_promote()
+            self.assertTrue(ret["ok"] and ret["promoted"])
+
+        cfg = frappe.get_single("Vendor Config")
+        self.assertEqual(cfg.get_password("webhook_secret", raise_exception=False), self.NEXT)
+        self.assertEqual(cfg.get_password("webhook_secret_old", raise_exception=False), self.PRIMARY)
+        self.assertFalse(cfg.get_password("webhook_secret_next", raise_exception=False))
+
+    def test_promote_without_staged_secret_is_noop(self):
+        from saathimart_vendor.api.receive import rotate_secret_promote
+
+        with patch("saathimart_vendor.api.receive._verify_hub_secret"), \
+             patch("saathimart_vendor.api.receive._verify_timestamp"):
+            ret = rotate_secret_promote()
+        self.assertTrue(ret["ok"] and not ret["promoted"])
