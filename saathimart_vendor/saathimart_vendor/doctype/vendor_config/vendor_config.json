@@ -35,13 +35,15 @@
    "fieldname": "api_key",
    "fieldtype": "Data",
    "label": "API Key",
-   "reqd": 1
+   "reqd": 0,
+   "description": "Legacy token-auth credential, unused by current HMAC-based hub sync (see webhook_secret below)."
   },
   {
    "fieldname": "api_secret",
    "fieldtype": "Password",
    "label": "API Secret",
-   "reqd": 1
+   "reqd": 0,
+   "description": "Legacy token-auth credential, unused by current HMAC-based hub sync (see webhook_secret below)."
   },
   {
    "fieldname": "webhook_secret",

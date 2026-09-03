@@ -28,19 +28,51 @@ def dispatch_event(event, payload):
     means an event replayed via catch-up runs through exactly the same
     idempotent handler as one delivered live; there's no separate
     "replay" code path that could drift out of sync with the real one.
+
+    stock.batch / events.batch are envelopes, not real event types — see
+    _unpack_batch. Unpacked here (rather than in receive_from_hub) so
+    catch-up polling gets the same unwrapping for any batch it replays.
     """
+    if event in ("stock.batch", "events.batch"):
+        for inner_event, inner_payload in _unpack_batch(event, payload):
+            dispatch_event(inner_event, inner_payload)
+        return
+
     handlers = {
         "order.new":        _handle_new_order,
         "order.cancel":     _handle_order_cancel,
         "order.reassign":   _handle_order_reassign,
         "product.new":      _handle_new_product,
         "payment.received": _handle_payment_received,
+        "stock.snapshot":   _handle_stock_snapshot,
     }
     handler = handlers.get(event)
     if handler:
         handler(payload)
     else:
         frappe.log_error(f"Unknown event from hub: {event}", "Vendor Receive")
+
+
+def _unpack_batch(event, payload):
+    """
+    Unpack a hub batch envelope (see saathimart/api/event_batch.py — same
+    format, duplicated here rather than imported since this app and the hub
+    app run as separate Frappe sites/processes and can't import each
+    other's code).
+
+    stock.batch: {"items": [{"product", "stock_qty", "warehouse"}, ...]}
+      -> yields ("stock.update", item) per item.
+    events.batch: {"events": [{"event_type", "payload"}, ...]}
+      -> yields (event_type, payload) per entry.
+    """
+    if event == "stock.batch":
+        return [("stock.update", item) for item in (payload.get("items") or [])]
+    if event == "events.batch":
+        return [
+            (e.get("event_type"), e.get("payload") or {})
+            for e in (payload.get("events") or [])
+        ]
+    return []
 
 
 @frappe.whitelist(allow_guest=True)
@@ -164,7 +196,14 @@ def _handle_new_order(payload):
             "rate":      rate,
         })
 
-    doc.insert(ignore_permissions=True)
+    try:
+        doc.insert(ignore_permissions=True)
+    except frappe.DuplicateEntryError:
+        # Two near-simultaneous deliveries of the same order.new event (hub
+        # retry + original) can both pass the exists() check above before
+        # either commits. Treat the race the same as the normal early-return:
+        # the order already exists, so this delivery is a no-op success.
+        return
 
     if unmapped_notes:
         doc.notes = "\n".join(unmapped_notes)
@@ -267,6 +306,67 @@ def _handle_new_product(payload):
         return
 
     mapping._auto_create_vendor_listing(None)
+
+
+def _handle_stock_snapshot(payload):
+    """
+    Hub sends its full Vendor Stock snapshot (api/stock_snapshot.py,
+    hourly). This is comparison-only — ERPNext's Bin here is this vendor's
+    real inventory and stays authoritative; the hub's copy is a cache that
+    reconciliation.py already corrects hourly per-product. This just
+    widens that check to every product in one pass (a snapshot catches
+    drift on a product no individual stock.* event ever mentioned) and
+    reports what it finds back to the hub — it never writes to Bin.
+
+    Reports via the same events.receive() path a normal vendor->hub push
+    uses, as event "stock.snapshot_report", so it's authenticated and
+    audited exactly like any other inbound event.
+    """
+    from saathimart_vendor.utils import get_config, hub_post
+
+    config = get_config()
+    if not config:
+        return
+
+    vendor_id = payload.get("vendor") or config.vendor_id
+    discrepancies = []
+
+    for item in (payload.get("stock") or []):
+        hub_product_id = item.get("product")
+        hub_qty = flt(item.get("stock_qty") or 0)
+        if not hub_product_id:
+            continue
+
+        # Product Mapping is keyed by ERPNext item_code, not the hub's
+        # product id — resolve via hub_product_id the same way
+        # api/stock.py:get_stock_qty's barcode-lookup fallback does.
+        item_code = frappe.db.get_value(
+            "Product Mapping",
+            {"hub_product_id": hub_product_id, "vendor": config.vendor_id, "sync_status": "Mapped"},
+            "item_code",
+        )
+        if not item_code:
+            continue  # not mapped on this vendor — nothing to compare
+
+        wh = config.default_warehouse
+        actual_qty = flt(frappe.db.get_value(
+            "Bin", {"item_code": item_code, "warehouse": wh}, "actual_qty"
+        ) or 0)
+
+        if actual_qty != hub_qty:
+            discrepancies.append({
+                "product": hub_product_id,
+                "item_code": item_code,
+                "hub_qty": hub_qty,
+                "local_qty": actual_qty,
+                "diff": actual_qty - hub_qty,
+            })
+
+    if discrepancies:
+        hub_post(config, "saathimart.api.events.receive", {
+            "event": "stock.snapshot_report",
+            "payload": {"vendor": vendor_id, "discrepancies": discrepancies},
+        })
 
 
 def _handle_payment_received(payload):

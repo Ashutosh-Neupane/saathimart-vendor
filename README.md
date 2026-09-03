@@ -53,21 +53,27 @@ and submits an ERPNext Sales Order), `mark_dispatched()`, `mark_delivered()`,
 
 ## Quick start
 
-Runs as part of the combined stack from the repo root (`docker-compose.saathimart.yml`);
-3 vendor sites (`vendor1/2/3.localhost`) share one bench/container:
+Runs as part of the combined stack, from the parent directory that contains
+both this repo and `saathimart` (the hub) — `docker-compose.saathimart.yml`
+lives there, one level up from this README:
 
 ```bash
-docker compose -f docker-compose.saathimart.yml up --build -d
+docker compose -f ../docker-compose.saathimart.yml up --build -d
 ```
 
-Sites available at `http://localhost:8001` / `8002` / `8003`. Configure
-`Vendor Config` on each site (Setup → Vendor Config) with the hub URL and
-`vendor_id` assigned by the SaathiMart admin before sync starts.
+By default one vendor site (`vendor1.localhost`) is created, available at
+`http://localhost:8001`. Add more names to that file's `VENDOR_SITES` env var
+(space-separated, e.g. `vendor1.localhost vendor2.localhost`) if you need
+several vendor sites sharing the same bench/container — each additional site
+still comes up behind the same port, distinguished by `Host` header, since
+there is no nginx router in front of them. Configure `Vendor Config` on each
+site (Setup → Vendor Config) with the hub URL and `vendor_id` assigned by the
+SaathiMart admin before sync starts.
 
 ## Testing
 
 ```bash
-docker compose -f docker-compose.saathimart.yml exec vendors \
+docker compose -f ../docker-compose.saathimart.yml exec vendor \
     bench --site vendor1.localhost run-tests --app saathimart_vendor
 ```
 
