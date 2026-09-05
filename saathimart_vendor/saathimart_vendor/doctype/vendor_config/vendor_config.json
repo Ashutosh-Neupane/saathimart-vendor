@@ -123,13 +123,6 @@
    "fieldtype": "Column Break"
   },
   {
-   "fieldname": "warehouse_synced_at",
-   "fieldtype": "Datetime",
-   "label": "Warehouse Synced At",
-   "read_only": 1,
-   "description": "When warehouses were last synced from the hub"
-  },
-  {
    "fieldname": "default_warehouse",
    "fieldtype": "Link",
    "label": "Default Warehouse",
@@ -176,16 +169,11 @@
    "default": "1"
   },
   {
-   "fieldname": "reconciliation_threshold",
-   "fieldtype": "Float",
-   "label": "Drift Threshold (units)",
-   "default": "2"
-  },
-  {
    "fieldname": "reconciliation_threshold_pct",
    "fieldtype": "Float",
    "label": "Drift Threshold (%)",
-   "default": "5"
+   "default": "5",
+   "description": "Maximum percentage drift allowed before creating stock adjustment event"
   }
  ],
  "permissions": [

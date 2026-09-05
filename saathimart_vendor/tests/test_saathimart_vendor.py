@@ -56,6 +56,9 @@ def setUpModule():
     doc = frappe.get_single("Vendor Config")
     _original_vendor_config = {f: doc.get(f) for f in _VENDOR_CONFIG_FIELDS}
     _original_vendor_api_secret = doc.get_password("api_secret", raise_exception=False)
+    # Bare test DBs have none of the ERPNext masters (Item Groups, UOMs,
+    # Price Lists) that the suite relies on — seed them up front.
+    _ensure_base_fixtures()
 
 
 def tearDownModule():
@@ -92,16 +95,35 @@ def _ensure_fiscal_year():
 
 
 def _ensure_base_fixtures():
-    """Warehouse Type: Transit (needed by Company.on_update's
-    create_default_warehouses()) and a Standard Selling Price List (needed
-    by Sales Order.set_missing_values()) — nothing on a fresh test site
-    creates these except the Setup Wizard, which never runs here.
+    """Seed the minimal ERPNext masters every test needs, none of which a
+    fresh `bench run-tests` database has (the Setup Wizard — the normal
+    source of Item Groups, UOMs, Warehouse Types and Price Lists — never
+    runs against a test DB).
+
     erpnext.setup.setup_wizard.operations.install_fixtures.install() would
-    normally provide both (plus Item Groups, Stock Entry Types, etc.), but
-    it hits a NestedSetRecursionError on its Sales Person fixture on this
-    ERPNext version — create just the two records actually needed instead
-    of pulling in that whole (currently broken) installer.
+    normally provide all of these at once, but it hits a
+    NestedSetRecursionError on its Sales Person fixture on this ERPNext
+    version — so create just the handful of records actually needed
+    instead of pulling in that whole (currently broken) installer.
+
+    All helpers here are idempotent, so it is safe to call from
+    setUpModule() and again from individual helpers (_make_item, etc.).
     """
+    # Item Group tree root — every Item insert link-validates against it.
+    if not frappe.db.exists("Item Group", "All Item Groups"):
+        ig = frappe.new_doc("Item Group")
+        ig.item_group_name = "All Item Groups"
+        ig.is_group = 1
+        ig.insert(ignore_permissions=True)
+    # Standard whole-number UOM — Item.stock_uom link-validates against it.
+    if not frappe.db.exists("UOM", "Nos"):
+        uom = frappe.new_doc("UOM")
+        uom.uom_name = "Nos"
+        uom.enabled = 1
+        uom.must_be_whole_number = 1
+        uom.insert(ignore_permissions=True)
+    # Warehouse Type: Transit (needed by Company.on_update's
+    # create_default_warehouses())
     if not frappe.db.exists("Warehouse Type", "Transit"):
         frappe.get_doc({"doctype": "Warehouse Type", "name": "Transit"}).insert(ignore_permissions=True)
     for pl_name, buying, selling in [("Standard Buying", 1, 0), ("Standard Selling", 0, 1)]:
@@ -148,6 +170,9 @@ def _ensure_warehouse(company=None):
 
 
 def _make_item(item_code, item_name=None):
+    # Item inserts link-validate against the Item Group tree root and the
+    # UOM — make sure a bare test DB (no Setup Wizard) has them.
+    _ensure_base_fixtures()
     if frappe.db.exists("Item", item_code):
         return frappe.get_doc("Item", item_code)
     doc = frappe.new_doc("Item")
@@ -711,7 +736,9 @@ class TestReceiveFromHub(unittest.TestCase):
         with patch("saathimart_vendor.api.receive._verify_hub_secret"), \
              patch("saathimart_vendor.api.receive._verify_timestamp"):
             result = receive_from_hub(event="order.teleported", payload={})
-        self.assertEqual(result, {"ok": True})
+        # receive_from_hub deliberately echoes the event name back so async
+        # callers / dead-letter retries can correlate the response.
+        self.assertEqual(result, {"ok": True, "event": "order.teleported"})
 
 
 # ── Test: Vendor Order lifecycle ────────────────────────────────────────────────

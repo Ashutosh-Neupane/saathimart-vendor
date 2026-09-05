@@ -54,14 +54,6 @@
    "description": "Gateway reference (e.g. eSewa transaction code) sent by the hub with payment.received."
   },
   {
-   "fieldname": "payment_entry",
-   "fieldtype": "Link",
-   "label": "Payment Entry",
-   "options": "Payment Entry",
-   "read_only": 1,
-   "description": "ERPNext Payment Entry created when the hub confirms payment."
-  },
-  {
    "fieldname": "section_customer",
    "fieldtype": "Section Break",
    "label": "Customer"
@@ -107,21 +99,8 @@
    "description": "Specific warehouse this order should be fulfilled from. Set by the hub during routing."
   },
   {
-   "fieldname": "erpnext_warehouse",
-   "fieldtype": "Link",
-   "label": "ERPNext Warehouse",
-   "options": "Warehouse",
-   "description": "Mapped ERPNext warehouse on this site for this fulfillment"
-  },
-  {
    "fieldname": "col_break_wh_order",
    "fieldtype": "Column Break"
-  },
-  {
-   "fieldname": "warehouse_distance_km",
-   "fieldtype": "Float",
-   "label": "Distance (km)",
-   "description": "Distance from the fulfillment warehouse to the customer"
   },
   {
    "fieldname": "section_items",
