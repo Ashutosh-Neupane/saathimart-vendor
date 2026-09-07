@@ -466,10 +466,11 @@ def _handle_payment_received(payload):
     try:
         from saathimart_vendor.api.vendor_accounting import (
             record_commission_expense,
+            record_tds_withheld,
             record_platform_coupon_reimbursement,
             record_loyalty_reimbursement,
         )
-        from frappe.utils import flt
+        from frappe.utils import flt, rounded
 
         grand_total = payload.get("amount") or doc.grand_total
         commission_pct = frappe.db.get_value("Vendor Config", {}, "commission_pct") or 10
@@ -477,6 +478,11 @@ def _handle_payment_received(payload):
 
         # Record commission expense
         record_commission_expense(hub_order_id, commission_amount, commission_pct)
+
+        # TDS on commission (Income Tax Act s88): the vendor withholds 15%
+        # of the commission it pays the platform and deposits it with IRD.
+        tds_rate = flt(frappe.db.get_single_value("Vendor Config", "tds_rate") or 15.0)
+        record_tds_withheld(hub_order_id, commission_amount, tds_rate)
 
         # Record platform coupon reimbursement (if any)
         platform_coupon = payload.get("platform_coupon_amount", 0)
@@ -536,9 +542,10 @@ def _handle_settlement(payload):
         )
         create_settlement_journal_entry(
             vendor_order_id=payout_id,
-            settlement_amount=amount,
-            commission_amount=commission,
+            settlement_amount=amount,          # net of TDS — hub already withheld it
+            commission_amount=commission,      # accepted for logging/back-compat only
             reference=payload.get("reference", ""),
+            tds_amount=payload.get("tds_amount", 0),
         )
 
         # Confirm receipt back to hub via Sync Outbox

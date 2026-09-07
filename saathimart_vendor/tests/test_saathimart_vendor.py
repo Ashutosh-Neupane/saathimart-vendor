@@ -448,7 +448,11 @@ class TestSyncOutbox(unittest.TestCase):
         self.assertEqual(mock_post.call_count, 1)
         called_url = mock_post.call_args.args[0]
         self.assertIn("bulk_receive", called_url)
-        sent_events = mock_post.call_args.kwargs["json"]["events"]
+        # HMAC delivery sends the exact signed body via data=, not json= —
+        # the signature must cover the wire bytes, so parse the body here.
+        import json as _json
+        sent_body = _json.loads(mock_post.call_args.kwargs["data"])
+        sent_events = sent_body["events"]
         self.assertEqual(len(sent_events), 3)
         for i in range(3):
             status = frappe.db.get_value(

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import frappe
 from frappe import _
-from frappe.utils import flt, nowdate
+from frappe.utils import flt, nowdate, rounded
 
 
 # ── Vendor Chart of Accounts ─────────────────────────────────────────────────
@@ -32,6 +32,7 @@ VENDOR_ACCOUNTS = {
     "vat_output":             "Output VAT",
     "vat_input":              "Input VAT",
     "clearing_platform":      "SaathiMart Clearing",
+    "tds_payable":            "TDS Payable",
     "commission_expense":     "Marketplace Commission",
     "platform_coupon_income": "Platform Coupon Reimbursement",
     "loyalty_income":         "Loyalty Reimbursement",
@@ -62,6 +63,7 @@ _FUZZY_FALLBACKS = {
     "vat_output":             ["VAT", "Duties and Taxes"],
     "vat_input":              ["VAT", "Duties and Taxes"],
     "clearing_platform":      ["Accounts Receivable", "Debtors"],
+    "tds_payable":            ["TDS Payable", "TDS", "Duties and Taxes"],
     "commission_expense":     ["Commission on Sales", "Indirect Expenses"],
     "platform_coupon_income": ["Indirect Income"],
     "loyalty_income":         ["Indirect Income"],
@@ -76,9 +78,19 @@ def _get_account(account_key):
     ERPNext appends " - XX" (company abbreviation) to account names, so
     we search by LIKE to match regardless of suffix. GL entries require
     leaf (non-group) accounts.
+
+    Multi-company safety: a vendor site can hold several Companies (test +
+    load + production). The resolved account MUST belong to the company
+    _get_company() returns, otherwise ERPNext rejects the GL Entry with
+    "Account X does not belong to Company Y". Every lookup is therefore
+    company-scoped, and the cache key includes the company.
     """
-    # Check cached value first
-    cached = VENDOR_ACCOUNTS.get(account_key)
+    company = _get_company()
+    if not company:
+        return None
+
+    cache_key = f"{company}:{account_key}"
+    cached = _account_cache.get(cache_key)
     if cached and frappe.db.exists("Account", cached):
         return cached
 
@@ -88,29 +100,33 @@ def _get_account(account_key):
         frappe.log_error(f"Vendor account {account_key} not found", "Vendor Accounting")
         return None
 
-    # Prefer leaf accounts
+    # Prefer leaf accounts in THIS company
     found = frappe.db.get_value(
         "Account",
-        {"account_name": ["like", f"{search_name}%"], "is_group": 0},
+        {"account_name": ["like", f"{search_name}%"], "is_group": 0, "company": company},
         "name",
     )
     if found:
-        VENDOR_ACCOUNTS[account_key] = found
+        _account_cache[cache_key] = found
         return found
 
-    # Fuzzy fallback — prefer non-group
+    # Fuzzy fallback — prefer non-group, still company-scoped
     for keyword in _FUZZY_FALLBACKS.get(account_key, []):
         found = frappe.db.get_value(
             "Account",
-            {"account_name": ["like", f"%{keyword}%"], "is_group": 0},
+            {"account_name": ["like", f"%{keyword}%"], "is_group": 0, "company": company},
             "name",
         )
         if found:
-            VENDOR_ACCOUNTS[account_key] = found
+            _account_cache[cache_key] = found
             return found
 
-    frappe.log_error(f"Vendor account {account_key} does not exist", "Vendor Accounting")
+    frappe.log_error(f"Vendor account {account_key} does not exist for company {company}", "Vendor Accounting")
     return None
+
+
+# Per-company account resolution cache (see _get_account)
+_account_cache: dict = {}
 
 
 def _get_company():
@@ -255,16 +271,20 @@ def create_vendor_sales_invoice_gl(vendor_order_id, items, grand_total, tax_amou
 # the vendor never receives cash from the customer directly.
 
 def create_settlement_journal_entry(vendor_order_id, settlement_amount,
-                                     commission_amount=0, reference=""):
+                                     commission_amount=0, reference="",
+                                     tds_amount=0):
     """
     Create a Journal Entry when the platform settles (pays) the vendor.
 
-    Three-party clearing house model:
-      DR: Bank/Cash                          (money received from platform)
-      DR: Marketplace Commission Expense       (platform's cut)
-      CR: SaathiMart Clearing Account          (clears the receivable)
+    Commission expense and TDS were already recognised at order time (see
+    record_commission_expense / record_tds_withheld) — this entry only
+    moves money:
 
-    This is the ONLY time cash hits the vendor's books.
+      DR: Bank/Cash                    (cash actually received)
+      CR: SaathiMart Clearing Account  (clears the receivable)
+
+    `settlement_amount` from the hub is already net of TDS (the hub books
+    the withheld 15% of commission as its TDS Receivable).
     """
     # Avoid double-entry
     if frappe.db.exists("GL Entry", {
@@ -279,7 +299,6 @@ def create_settlement_journal_entry(vendor_order_id, settlement_amount,
 
     bank_account = _get_account("cash_bank")
     clearing_account = _get_account("clearing_platform")
-    commission_account = _get_account("commission_expense")
 
     # Bank/Cash debit — actual money received
     if bank_account:
@@ -290,22 +309,12 @@ def create_settlement_journal_entry(vendor_order_id, settlement_amount,
             "remarks": f"Settlement received from SaathiMart for {vendor_order_id}",
         })
 
-    # Commission expense debit
-    if commission_account and flt(commission_amount) > 0:
-        entries.append({
-            "account": commission_account,
-            "debit": flt(commission_amount, 2),
-            "credit": 0,
-            "remarks": f"Commission deducted for {vendor_order_id}",
-        })
-
-    # Clearing Account credit — clears the full receivable
+    # Clearing Account credit — clears the receivable
     if clearing_account:
-        total_receivable = flt(settlement_amount) + flt(commission_amount)
         entries.append({
             "account": clearing_account,
             "debit": 0,
-            "credit": flt(total_receivable, 2),
+            "credit": flt(settlement_amount, 2),
             "remarks": f"Clearing receivable for {vendor_order_id}",
         })
 
@@ -317,6 +326,54 @@ def create_settlement_journal_entry(vendor_order_id, settlement_amount,
             remarks=f"Settlement for {vendor_order_id}" + (f" (ref: {reference})" if reference else ""),
             posting_date=posting_date,
         )
+
+
+# ── TDS Withheld on Commission (Income Tax Act 2058, s88) ───────────────────
+# The commission the vendor pays SaathiMart is a service charge, so the
+# vendor must withhold 15% of it and deposit it with IRD. Recorded at the
+# same moment the commission expense is booked, so the liability never
+# exists without its withholding.
+
+def record_tds_withheld(vendor_order_id, commission_amount, tds_rate=15.0):
+    """
+    DR: Marketplace Commission Expense (TDS portion — reduces net expense)
+    CR: TDS Payable                    (owed to IRD)
+
+    Net effect: commission expense shows gross, TDS Payable shows what the
+    vendor must deposit with IRD and certify to SaathiMart.
+    """
+    tds = rounded(flt(commission_amount) * flt(tds_rate) / 100.0, 2)
+    if tds <= 0:
+        return
+
+    if frappe.db.exists("GL Entry", {
+        "voucher_no": vendor_order_id,
+        "voucher_type": "Journal Entry",
+        "remarks": ["like", "%TDS withheld%"],
+    }):
+        return
+
+    tds_account = _get_account("tds_payable")
+    commission_account = _get_account("commission_expense")
+    if not (tds_account and commission_account):
+        return
+
+    create_gl_entries_batch([
+        {
+            "account": tds_account,
+            "debit": 0,
+            "credit": tds,
+            "remarks": f"TDS withheld on SaathiMart commission for {vendor_order_id}",
+        },
+        {
+            "account": commission_account,
+            "debit": 0,
+            "credit": tds,
+            "remarks": f"TDS withheld on commission (s88) for {vendor_order_id}",
+        },
+    ], voucher_type="Journal Entry",
+       voucher_no=vendor_order_id,
+       remarks=f"TDS withheld on commission for {vendor_order_id}")
 
 
 # ── Commission Expense GL Entries ────────────────────────────────────────────

@@ -90,11 +90,15 @@ def _push_bulk(config, rows):
         for row in rows
     ]
 
+    # Sign over the EXACT body being sent — hub_headers() must receive the
+    # serialized JSON or the signature covers "" while the wire carries the
+    # events, and the hub rejects every delivery with 401 Invalid signature.
+    body = json.dumps({"events": events})
     try:
         resp = requests.post(
             f"{config.hub_url}/api/method/saathimart.api.events.bulk_receive",
-            json={"events": events},
-            headers=hub_headers(config),
+            data=body,
+            headers=hub_headers(config, body),
             timeout=30,
         )
         if resp.ok:
@@ -116,14 +120,17 @@ def _push_bulk(config, rows):
 
 
 def _push_to_hub(config, row):
+    # Sign over the EXACT body being sent (see _push_bulk — signing an empty
+    # string while sending JSON made the hub reject every event with 401).
+    body = json.dumps({
+        "event":   row.event_type,
+        "payload": json.loads(row.payload or "{}"),
+    })
     try:
         resp = requests.post(
             f"{config.hub_url}/api/method/saathimart.api.events.receive",
-            json={
-                "event":   row.event_type,
-                "payload": json.loads(row.payload or "{}"),
-            },
-            headers=hub_headers(config),
+            data=body,
+            headers=hub_headers(config, body),
             timeout=10,
         )
         if resp.ok:

@@ -174,6 +174,20 @@
    "label": "Drift Threshold (%)",
    "default": "5",
    "description": "Maximum percentage drift allowed before creating stock adjustment event"
+  },
+  {
+   "fieldname": "commission_pct",
+   "fieldtype": "Float",
+   "label": "SaathiMart Commission %",
+   "default": "10",
+   "description": "Commission this vendor pays the platform on hub orders (agreed contract rate)"
+  },
+  {
+   "fieldname": "tds_rate",
+   "fieldtype": "Float",
+   "label": "TDS Rate on Commission %",
+   "default": "15",
+   "description": "Withholding rate applied to the SaathiMart commission under Income Tax Act 2058 s88 — vendor deposits it with IRD and certifies it to the platform"
   }
  ],
  "permissions": [

@@ -43,6 +43,15 @@ class VendorOrder(Document):
             if wh_row:
                 self.erpnext_warehouse = wh_row.erpnext_warehouse
                 fulfillment_warehouse = wh_row.erpnext_warehouse
+            else:
+                # Hub sent a warehouse we have no mapping for (warehouse sync
+                # hasn't run yet, or the hub added a new branch). Falling back
+                # to the default warehouse beats crashing: an unmapped hub
+                # warehouse name passed into the Sales Order made ERPNext's
+                # nested-set lookup explode with "cannot unpack non-iterable
+                # NoneType" — an opaque 500 instead of an order we can fulfill.
+                self.erpnext_warehouse = config.default_warehouse
+                fulfillment_warehouse = config.default_warehouse
 
         so = frappe.new_doc("Sales Order")
         so.customer = _get_or_create_customer(self.customer_name, self.customer_phone)

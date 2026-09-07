@@ -44,6 +44,11 @@ doc_events = {
 
 # ── Scheduled tasks ───────────────────────────────────────────────────
 scheduler_events = {
+    "all": [
+        # Redis Streams consumer - processes events from hub every 4 minutes
+        # Uses consumer groups for parallel processing and automatic retry
+        "saathimart_vendor.streams.worker.consume_hub_events",
+    ],
     "daily": [
         "saathimart_vendor.tasks.archive_old_outbox",
     ],
