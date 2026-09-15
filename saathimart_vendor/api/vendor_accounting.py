@@ -189,6 +189,119 @@ _PROVISIONABLE = {
 }
 
 
+# ── Platform (Entity A) account resolution ───────────────────────────────
+# The hub pushes its own ledger postings (platform.ledger_entry events) to
+# whichever vendor site is designated SaathiMart Settings > Platform Ledger
+# Vendor. Those accounts describe the PLATFORM's books, not this vendor's,
+# and standard charts don't carry them — resolved/provisioned under a
+# dedicated "SaathiMart Platform" name prefix so they can never collide
+# with this site's own vendor-book accounts (which share generic names
+# like "TDS Payable").
+
+PLATFORM_ACCOUNT_FALLBACKS = {
+    "cash_bank":               ["Cash/Bank"],
+    "revenue":                 ["Product Revenue"],
+    "commission_income":       ["Marketplace Commission"],
+    "platform_coupon_exp":     ["Platform Coupon Expense"],
+    "loyalty_expense":         ["Loyalty Points Expense"],
+    "delivery_income":         ["Delivery Service Income"],
+    "clearing_vendor":         ["Clearing Account - Vendor"],
+    "clearing_logistics":      ["Clearing Account - Logistics"],
+    "tds_receivable":          ["TDS Receivable"],
+    "tds_payable":             ["TDS Payable"],
+    "platform_coupon_payable": ["Platform Coupon Payable"],
+    "loyalty_payable":         ["Loyalty Payable"],
+    "vat_output":              ["Output VAT"],
+    "vat_input":               ["Input VAT"],
+    "accounts_receivable":     ["Accounts Receivable"],
+    "accounts_payable":        ["Accounts Payable"],
+}
+
+_PLATFORM_PROVISIONABLE = {
+    "cash_bank":        {"parents": ["Current Assets", "Current Asset"], "root_type": "Asset", "account_type": "Bank"},
+    "clearing_vendor":  {"parents": ["Current Assets", "Current Asset"], "root_type": "Asset", "account_type": None},
+    "clearing_logistics": {"parents": ["Current Assets", "Current Asset"], "root_type": "Asset", "account_type": None},
+    "platform_coupon_payable": {"parents": ["Current Liabilities"], "root_type": "Liability", "account_type": None},
+    "loyalty_payable":  {"parents": ["Current Liabilities"], "root_type": "Liability", "account_type": None},
+    "tds_receivable":   {"parents": ["Current Assets", "Current Asset"], "root_type": "Asset", "account_type": "Tax"},
+    "tds_payable":      {"parents": ["Duties and Taxes", "Current Liabilities"], "root_type": "Liability", "account_type": "Tax"},
+    "commission_income": {"parents": ["Indirect Income", "Direct Income", "Income"], "root_type": "Income", "account_type": "Income Account"},
+    "platform_coupon_exp": {"parents": ["Indirect Expenses", "Direct Expenses", "Expenses"], "root_type": "Expense", "account_type": "Expense Account"},
+    "loyalty_expense":  {"parents": ["Indirect Expenses", "Direct Expenses", "Expenses"], "root_type": "Expense", "account_type": "Expense Account"},
+    "delivery_income":  {"parents": ["Direct Income", "Income"], "root_type": "Income", "account_type": "Income Account"},
+    "revenue":          {"parents": ["Direct Income", "Income"], "root_type": "Income", "account_type": "Income Account"},
+    "vat_output":       {"parents": ["Duties and Taxes", "Current Liabilities"], "root_type": "Liability", "account_type": "Tax"},
+    "vat_input":        {"parents": ["Duties and Taxes", "Current Assets"], "root_type": "Asset", "account_type": "Tax"},
+    "accounts_receivable": {"parents": ["Current Assets", "Current Asset"], "root_type": "Asset", "account_type": "Receivable"},
+    "accounts_payable": {"parents": ["Current Liabilities"], "root_type": "Liability", "account_type": "Payable"},
+}
+
+
+def get_platform_account(account_key):
+    """Resolve (or lazily provision) the PLATFORM's account for account_key.
+
+    Mirrors _get_account but against the "SaathiMart Platform"-prefixed
+    chart. Returns None (caller fails closed) if the key is unknown or
+    provisioning is impossible on this chart.
+    """
+    company = _get_company()
+    if not company:
+        return None
+    key = f"platform:{company}:{account_key}"
+    cached = _account_cache.get(key)
+    if cached and frappe.db.exists("Account", cached):
+        return cached
+
+    names = PLATFORM_ACCOUNT_FALLBACKS.get(account_key) or []
+    prefix = "SaathiMart Platform"
+    for name in names:
+        found = frappe.db.get_value(
+            "Account",
+            {"account_name": ["like", f"{prefix} {name}%"], "is_group": 0, "company": company},
+            "name",
+        )
+        if found:
+            _account_cache[key] = found
+            return found
+
+    spec = _PLATFORM_PROVISIONABLE.get(account_key)
+    if not spec or not names:
+        return None
+    parent = None
+    for parent_name in spec["parents"]:
+        parent = frappe.db.get_value(
+            "Account",
+            {"account_name": ["like", f"{parent_name}%"], "is_group": 1, "company": company},
+            "name",
+        )
+        if parent:
+            break
+    if not parent:
+        return None
+    try:
+        acc = frappe.new_doc("Account")
+        acc.account_name = f"{prefix} {names[0]}"
+        acc.company = company
+        acc.parent_account = parent
+        acc.is_group = 0
+        acc.root_type = spec["root_type"]
+        acc.report_type = (
+            "Profit and Loss" if spec["root_type"] in ("Income", "Expense")
+            else "Balance Sheet"
+        )
+        if spec["account_type"]:
+            acc.account_type = spec["account_type"]
+        acc.insert(ignore_permissions=True)
+        _account_cache[key] = acc.name
+        return acc.name
+    except Exception:
+        frappe.log_error(
+            frappe.get_traceback(),
+            f"platform account provisioning failed: {account_key} for {company}",
+        )
+        return None
+
+
 def _provision_account(account_key: str, company: str) -> str | None:
     """Create a missing marketplace account under the right parent group."""
     spec = _PROVISIONABLE.get(account_key)
@@ -445,8 +558,12 @@ def create_settlement_journal_entry(vendor_order_id, settlement_amount,
       DR: Bank/Cash                    (cash actually received)
       CR: SaathiMart Clearing Account  (clears the receivable)
 
-    `settlement_amount` from the hub is already net of TDS (the hub books
-    the withheld 15% of commission as its TDS Receivable).
+    `settlement_amount` from the hub is the GROSS payout (net + the s88
+    TDS the vendor withheld from the platform's commission bill — the
+    platform pays the withheld sum out too and keeps the certificate as
+    ITS TDS Receivable). The vendor's clearing receivable nets to exactly
+    this gross figure (sale at full base − commission bill incl. its VAT
+    + withheld TDS), so this entry zeroes it to the paisa.
     """
     # Avoid double-entry
     if frappe.db.exists("GL Entry", {
@@ -548,10 +665,13 @@ def record_tds_withheld(vendor_order_id, commission_amount, tds_rate=15.0):
 
 def record_commission_expense(vendor_order_id, commission_amount, commission_pct):
     """
-    Record marketplace commission as an expense for the vendor.
-    
-    DR: Marketplace Commission Expense
-    CR: SaathiMart Clearing Account
+    Record marketplace commission as an expense for the vendor, with the
+    13% input VAT on the platform's commission bill (the platform invoices
+    commission + service VAT; the vendor claims the VAT as input credit): 
+
+    DR: Marketplace Commission Expense   (net commission)
+    DR: Input VAT                        (13% of commission)
+    CR: SaathiMart Clearing Account      (gross payable to platform)
     """
     if flt(commission_amount) <= 0:
         return
@@ -561,18 +681,28 @@ def record_commission_expense(vendor_order_id, commission_amount, commission_pct
 
     commission_account = _get_account("commission_expense")
     clearing_account = _get_account("clearing_platform")
+    input_vat_account = _get_account("vat_input")
 
     if commission_account and clearing_account:
+        commission_amount = flt(commission_amount, 2)
+        input_vat = rounded(commission_amount * 13.0 / 100.0, 2)
         entries.append({
             "account": commission_account,
-            "debit": flt(commission_amount, 2),
+            "debit": commission_amount,
             "credit": 0,
             "remarks": f"Commission ({commission_pct}%) for {vendor_order_id}",
         })
+        if input_vat > 0 and input_vat_account:
+            entries.append({
+                "account": input_vat_account,
+                "debit": input_vat,
+                "credit": 0,
+                "remarks": f"Input VAT on commission bill for {vendor_order_id}",
+            })
         entries.append({
             "account": clearing_account,
             "debit": 0,
-            "credit": flt(commission_amount, 2),
+            "credit": commission_amount + input_vat,
             "remarks": f"Commission payable to SaathiMart for {vendor_order_id}",
         })
 
@@ -670,6 +800,121 @@ def record_loyalty_reimbursement(vendor_order_id, loyalty_amount):
 # ── Whitelisted API Endpoints ────────────────────────────────────────────────
 
 @frappe.whitelist()
+def ensure_platform_party(party_type, party):
+	"""Ensure a GL-referenced party exists on this site; upsert if missing.
+
+	Platform ledger events carry Customer parties that exist only on the
+	hub — ERPNext's GL Entry.validate_party fetches the party doc and
+	crashes on None if it doesn't exist here. Returns the party name on
+	success, or None (caller drops the party refs rather than aborting
+	the whole batch — the party link is informational for cash rows).
+	"""
+	if not party_type or not party:
+		return None
+	if frappe.db.exists(party_type, party):
+		return party
+	try:
+		if party_type == "Customer":
+			c = frappe.new_doc("Customer")
+			c.customer_name = party
+			c.customer_type = "Individual"
+			c.customer_group = (
+				frappe.db.get_value("Customer Group", {"is_group": 0}, "name")
+				or "All Customer Groups"
+			)
+			c.territory = (
+				frappe.db.get_value("Territory", {"is_group": 0}, "name")
+				or "All Territories"
+			)
+			c.insert(ignore_permissions=True)
+			return c.name
+		return party
+	except Exception:
+		frappe.log_error(
+			frappe.get_traceback(),
+			f"platform party upsert failed: {party_type} {party}",
+		)
+		return None
+
+
+def create_platform_gl_entries(payload):
+    """Receiver for the hub's platform.ledger_entry events.
+
+    The hub (plain Frappe, no ERPNext) computes Entity A's postings —
+    commission income, platform coupon/loyalty expense, TDS receivable,
+    settlement money movements — and pushes the finished batch here. This
+    site keeps those books in ERPNext. Each entry carries a symbolic
+    account_key (PLATFORM_ACCOUNTS on the hub side); the real account is
+    resolved (or lazily provisioned) under the "SaathiMart Platform"
+    name prefix so they can never collide with this site's own vendor-book
+    accounts.
+
+    Idempotent: create_gl_entry dedupes on (account, voucher, amounts,
+    remarks); replayed deliveries are no-ops. Fails closed per batch:
+    any account that cannot be resolved aborts the whole voucher with
+    nothing posted (a half-posted platform ledger would be worse than a
+    delayed one — the hub's drain retries).
+    """
+    voucher_type = payload.get("voucher_type") or "Journal Entry"
+    voucher_no = payload.get("voucher_no") or ""
+    remarks = payload.get("remarks") or ""
+    entries = payload.get("entries") or []
+    if not voucher_no or not entries:
+        frappe.log_error(
+            f"platform.ledger_entry missing voucher_no or entries: {payload}",
+            "Platform Ledger Receiver",
+        )
+        return {"ok": False, "reason": "malformed"}
+
+    # Resolve all accounts FIRST — fail closed before writing anything.
+    resolved = []
+    for e in entries:
+        account = get_platform_account(e.get("account_key") or "")
+        if not account:
+            frappe.log_error(
+                f"platform.ledger_entry {voucher_no}: account_key "
+                f"{e.get('account_key')} unresolved — batch aborted, nothing posted",
+                "Platform Ledger Receiver",
+            )
+            return {"ok": False, "reason": f"unresolved:{e.get('account_key')}"}
+        resolved.append({**e, "account": account})
+
+    # Parties: upsert missing Customers (hub parties don't exist here).
+    # A party that can't be ensured loses its link but keeps its row —
+    # informational for cash entries, not worth aborting the batch.
+    for e in resolved:
+        if e.get("party"):
+            ensured = ensure_platform_party(e.get("party_type"), e.get("party"))
+            if not ensured:
+                e.pop("party", None)
+                e.pop("party_type", None)
+            else:
+                e["party"] = ensured
+
+    total_dr = rounded(sum(flt(e.get("debit")) for e in resolved), 2)
+    total_cr = rounded(sum(flt(e.get("credit")) for e in resolved), 2)
+    if abs(total_dr - total_cr) > 0.05:
+        frappe.log_error(
+            f"platform.ledger_entry {voucher_no} UNBALANCED: Dr {total_dr} vs Cr {total_cr} "
+            f"— batch aborted, nothing posted",
+            "Platform Ledger Receiver",
+        )
+        return {"ok": False, "reason": "unbalanced"}
+
+    for e in resolved:
+        create_gl_entry(
+            account=e["account"],
+            debit=e.get("debit", 0),
+            credit=e.get("credit", 0),
+            voucher_type=voucher_type,
+            voucher_no=voucher_no,
+            remarks=e.get("remarks") or remarks,
+            party_type=e.get("party_type"),
+            party=e.get("party"),
+        )
+    return {"ok": True, "entries": len(resolved)}
+
+
 def get_vendor_gl_entries(vendor_order_id=None, from_date=None, to_date=None):
     """Get GL entries for this vendor, optionally filtered by order and date range."""
     filters = {}

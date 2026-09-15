@@ -270,8 +270,18 @@ done
 # webhook secret the hub issued (so the vendor's future pushes verify
 # per-vendor). Location sync then runs over the now-trusted channel.
 echo "Registering vendor sites with hub and syncing locations..."
-for SITE in $VENDOR_SITES; do
-  cd "$BENCH/sites" && "$BENCH/env/bin/python" - "$SITE" "$WEBHOOK_SECRET" <<'PYEOF'
+# Retried on every boot. A single boot-time attempt is a race: when the
+# vendors container starts before the hub finishes booting, registration
+# fails once and the per-vendor secret never lands on either side — the
+# hub's Vendor row keeps no webhook_secret while the vendor site has one,
+# and every subsequent hub→vendor delivery fails signature verification
+# (observed repeatedly in e2e testing). Retry up to 6× with backoff so a
+# slow hub boot can't permanently desync the handshake.
+for ATTEMPT in 1 2 3 4 5 6; do
+  echo "Registration attempt $ATTEMPT/6..."
+  REG_OK=1
+  for SITE in $VENDOR_SITES; do
+  cd "$BENCH/sites" && "$BENCH/env/bin/python" - "$SITE" "$WEBHOOK_SECRET" <<'PYEOF' || REG_OK=0
 import sys
 site = sys.argv[1]
 webhook_secret = sys.argv[2]
@@ -336,7 +346,12 @@ except Exception as e:
     # already happened once when a CWD bug here made frappe.connect() raise
     # and, under init.sh's `set -e`, killed the whole container in a loop.
     print(f'  Registration/sync failed for {site}: {e}')
+    sys.exit(1)
 PYEOF
+  done
+  if [ "$REG_OK" = "1" ]; then break; fi
+  echo "  Some registrations failed — retrying in 20s..."
+  sleep 20
 done
 
 bench build --app saathimart_vendor || true

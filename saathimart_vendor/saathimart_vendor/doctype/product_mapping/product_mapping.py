@@ -33,7 +33,7 @@ class ProductMapping(Document):
 
     @frappe.whitelist()
     def sync_with_hub(self):
-        """Lookup barcode on hub and fill hub_product_id + hub_sku."""
+        """Lookup barcode on hub and fill hub_product_id."""
         config = get_config()
         if not config:
             frappe.throw(_("Vendor Config not set up"))
@@ -45,19 +45,16 @@ class ProductMapping(Document):
                          {"barcode": self.barcode})
         if not result:
             self.sync_status = "Error"
-            self.sync_error = f"Barcode {self.barcode} not found on hub"
             self.save(ignore_permissions=True)
             frappe.throw(_(f"Barcode {self.barcode} not found on SaathiMart hub"))
 
         self.hub_product_id = result.get("name")
-        self.hub_sku = result.get("sku") or ""
         self.sync_status = "Mapped"
-        self.sync_error = ""
         self.last_synced = frappe.utils.now_datetime()
         self.save(ignore_permissions=True)
 
         self._auto_create_vendor_listing(result)
-        return {"hub_product_id": self.hub_product_id, "hub_sku": self.hub_sku}
+        return {"hub_product_id": self.hub_product_id}
 
     def _get_current_selling_price(self):
         """Current selling Item Price for this mapping's item_code, or 0 if none set."""

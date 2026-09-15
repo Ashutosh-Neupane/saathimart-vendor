@@ -55,12 +55,30 @@ def dispatch_event(event, payload):
         "payment.received":    _handle_payment_received,
         "stock.snapshot":      _handle_stock_snapshot,
         "settlement.completed": _handle_settlement,
+        "platform.ledger_entry": _handle_platform_ledger_entry,
     }
     handler = handlers.get(event)
     if handler:
         handler(payload)
     else:
         frappe.log_error(f"Unknown event from hub: {event}", "Vendor Receive")
+
+
+def _handle_platform_ledger_entry(payload):
+    """
+    The hub pushed its own (Entity A) ledger batch for THIS site to book —
+    this site is designated SaathiMart Settings > Platform Ledger Vendor.
+    Any rejection (unresolved account, unbalanced batch) raises, so the
+    hub's delivery is marked failed and retried after the underlying
+    problem is fixed — a silently dropped platform ledger would corrupt
+    the platform's books.
+    """
+    from saathimart_vendor.api.vendor_accounting import create_platform_gl_entries
+    result = create_platform_gl_entries(payload)
+    if not result.get("ok"):
+        frappe.throw(
+            _("Platform ledger batch rejected: {0}").format(result.get("reason"))
+        )
 
 
 def _unpack_batch(event, payload):
@@ -200,7 +218,6 @@ def _handle_new_order(payload):
                         frappe.db.set_value("Product Mapping", existing.name, {
                             "hub_product_id": product_id,
                             "sync_status":    "Mapped",
-                            "sync_error":     "",
                             "last_synced":    frappe.utils.now_datetime(),
                         })
                         item_code = existing.item_code or ""
@@ -210,7 +227,6 @@ def _handle_new_order(payload):
                         pm.item_code       = ""
                         pm.vendor          = config.vendor_id
                         pm.hub_product_id  = product_id
-                        pm.hub_sku         = hub_result.get("sku", "")
                         pm.sync_status     = "Unmapped"
                         pm.insert(ignore_permissions=True)
                         unmapped_notes.append(
@@ -337,7 +353,6 @@ def _handle_new_product(payload):
     mapping.item_code = item_code
     mapping.vendor = config.vendor_id
     mapping.hub_product_id = hub_product_id
-    mapping.hub_sku = barcode
     mapping.sync_status = "Mapped"
     mapping.last_synced = now_datetime()
     try:
@@ -464,8 +479,6 @@ def record_payment_accounting(hub_order_id, payload):
     from saathimart_vendor.api.vendor_accounting import (
         record_commission_expense,
         record_tds_withheld,
-        record_platform_coupon_reimbursement,
-        record_loyalty_reimbursement,
         create_vendor_sales_invoice_gl,
     )
     from frappe.utils import flt, rounded
@@ -487,15 +500,12 @@ def record_payment_accounting(hub_order_id, payload):
     tds_rate = flt(frappe.db.get_single_value("Vendor Config", "tds_rate") or 15.0)
     record_tds_withheld(hub_order_id, commission_amount, tds_rate)
 
-    # Record platform coupon reimbursement (if any)
-    platform_coupon = payload.get("platform_coupon_amount", 0)
-    if flt(platform_coupon) > 0:
-        record_platform_coupon_reimbursement(hub_order_id, platform_coupon)
-
-    # Record loyalty reimbursement (if any)
-    loyalty_amount = payload.get("loyalty_amount", 0)
-    if flt(loyalty_amount) > 0:
-        record_loyalty_reimbursement(hub_order_id, loyalty_amount)
+    # NOTE: platform-coupon and loyalty reimbursement rows are deliberately
+    # NOT booked here any more. The sale below is posted at the FULL
+    # VAT-inclusive product base, so platform-funded discounts are already
+    # inside the SaathiMart Clearing receivable — booking separate
+    # reimbursement income rows double-counted them and inflated the
+    # settlement payout. The platform covers the funded gap at settlement.
 
     # ── The sale itself: revenue + Output VAT (the vendor's tax invoice GL)
     # The hub computes the per-vendor tax slice (vendor coupon reduces the
@@ -562,7 +572,7 @@ def _handle_settlement(payload):
         )
         create_settlement_journal_entry(
             vendor_order_id=payout_id,
-            settlement_amount=amount,          # net of TDS — hub already withheld it
+            settlement_amount=amount,          # GROSS (net + withheld s88 TDS) — zeroes clearing exactly
             commission_amount=commission,      # accepted for logging/back-compat only
             reference=payload.get("reference", ""),
             tds_amount=payload.get("tds_amount", 0),
@@ -719,5 +729,10 @@ def rotate_secret_promote():
     config.webhook_secret = staged
     config.webhook_secret_next = None
     config.save(ignore_permissions=True)
+    # The controller preserves secret fields the save doesn't carry a value
+    # for (so desk edits / boot saves can't wipe them) — an INTENTIONAL
+    # clear like this one must therefore delete the __Auth row explicitly.
+    from frappe.utils.password import remove_encrypted_password
+    remove_encrypted_password("Vendor Config", "Vendor Config", "webhook_secret_next")
     frappe.db.commit()
     return {"ok": True, "promoted": True}

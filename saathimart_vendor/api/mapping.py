@@ -91,9 +91,7 @@ def _auto_map_unmapped(config):
         if result:
             frappe.db.set_value("Product Mapping", row.name, {
                 "hub_product_id": result.get("name", ""),
-                "hub_sku":        result.get("sku", ""),
                 "sync_status":    "Mapped",
-                "sync_error":     "",
                 "last_synced":    frappe.utils.now_datetime(),
             })
             mapping = frappe.get_doc("Product Mapping", row.name)
@@ -163,12 +161,10 @@ def bulk_import(csv_content):
         doc.vendor     = config.vendor_id
         if hub_result:
             doc.hub_product_id = hub_result.get("name", "")
-            doc.hub_sku        = hub_result.get("sku", "")
             doc.sync_status    = "Mapped"
             doc.last_synced    = frappe.utils.now_datetime()
         else:
             doc.sync_status = "Unmapped"
-            doc.sync_error  = f"Barcode {barcode} not found on hub"
         try:
             doc.insert(ignore_permissions=True)
             created += 1
@@ -200,9 +196,7 @@ def sync_all_unmapped():
         if result:
             frappe.db.set_value("Product Mapping", row.name, {
                 "hub_product_id": result.get("name", ""),
-                "hub_sku":        result.get("sku", ""),
                 "sync_status":    "Mapped",
-                "sync_error":     "",
                 "last_synced":    frappe.utils.now_datetime(),
             })
             mapping = frappe.get_doc("Product Mapping", row.name)

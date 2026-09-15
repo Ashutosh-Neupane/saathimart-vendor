@@ -320,7 +320,9 @@ class TestProductMapping(unittest.TestCase):
         self.assertEqual(result["hub_product_id"], "SM-PROD-0001")
         mapping.reload()
         self.assertEqual(mapping.sync_status, "Mapped")
-        self.assertEqual(mapping.hub_sku, "TOMATO-1KG")
+        # hub_sku was removed from the doctype (ghost field) — sync only
+        # fills hub_product_id now.
+        self.assertFalse(mapping.meta.get_field("hub_sku"))
 
     @patch("saathimart_vendor.saathimart_vendor.doctype.product_mapping.product_mapping.hub_get")
     def test_sync_with_hub_not_found_raises_and_marks_error(self, mock_hub_get):
@@ -1081,19 +1083,22 @@ class TestHubAuthHmac(unittest.TestCase):
             f: doc.get_password(f, raise_exception=False) or ""
             for f in ("webhook_secret", "webhook_secret_old", "webhook_secret_next")
         }
-        doc.webhook_secret = self.PRIMARY
-        doc.webhook_secret_old = None
-        doc.webhook_secret_next = None
-        doc.flags.ignore_mandatory = True
-        doc.save(ignore_permissions=True)
+        # The controller preserves secret fields a save doesn't carry a value
+        # for (anti-wipe guard), so an intentional clear here must delete the
+        # __Auth rows explicitly — saving None no longer does it.
+        from frappe.utils.password import set_encrypted_password, remove_encrypted_password
+        set_encrypted_password("Vendor Config", "Vendor Config", self.PRIMARY, "webhook_secret")
+        remove_encrypted_password("Vendor Config", "Vendor Config", "webhook_secret_old")
+        remove_encrypted_password("Vendor Config", "Vendor Config", "webhook_secret_next")
         frappe.db.commit()
 
     def tearDown(self):
-        doc = frappe.get_single("Vendor Config")
+        from frappe.utils.password import set_encrypted_password, remove_encrypted_password
         for field, value in self._orig.items():
-            setattr(doc, field, value or None)
-        doc.flags.ignore_mandatory = True
-        doc.save(ignore_permissions=True)
+            if value:
+                set_encrypted_password("Vendor Config", "Vendor Config", value, field)
+            else:
+                remove_encrypted_password("Vendor Config", "Vendor Config", field)
         frappe.db.commit()
 
     # ── helpers ──
