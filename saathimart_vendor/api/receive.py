@@ -450,55 +450,51 @@ def _handle_payment_received(payload):
     doc.payment_reference = payload.get("reference") or doc.payment_reference or ""
     doc.save(ignore_permissions=True)
 
-    # Three-party clearing house model:
-    # The vendor does NOT create a Payment Entry here because the vendor
-    # never receives cash from the customer — the platform does. The
-    # vendor's receivable sits in "SaathiMart Clearing Account" until
-    # the platform settles (pays) the vendor.
-    #
-    # What we DO record:
-    #   1. Commission expense (liability to platform)
-    #   2. Platform coupon reimbursement (platform owes vendor)
-    #   3. Loyalty reimbursement (platform owes vendor)
-    #
-    # The actual cash Payment Entry is created during settlement
-    # (see vendor_accounting.py → create_settlement_journal_entry)
-    try:
-        from saathimart_vendor.api.vendor_accounting import (
-            record_commission_expense,
-            record_tds_withheld,
-            record_platform_coupon_reimbursement,
-            record_loyalty_reimbursement,
-        )
-        from frappe.utils import flt, rounded
+    # Shared idempotent accounting — used by BOTH the webhook transport
+    # (receive_from_hub) and the Redis Streams transport (streams.processor).
+    # Centralised so neither path can drift: whichever arrives first does
+    # the work, the other is a no-op. Guards live inside (order-level
+    # status flip + per-voucher GL existence checks), so at-least-once
+    # delivery on either transport can never double-book.
+    record_payment_accounting(hub_order_id, payload)
 
-        grand_total = payload.get("amount") or doc.grand_total
-        commission_pct = frappe.db.get_value("Vendor Config", {}, "commission_pct") or 10
-        commission_amount = flt(grand_total) * flt(commission_pct) / 100
 
-        # Record commission expense
-        record_commission_expense(hub_order_id, commission_amount, commission_pct)
+def record_payment_accounting(hub_order_id, payload):
+    """One-shot accounting for a fully-paid order (idempotent)."""
+    from saathimart_vendor.api.vendor_accounting import (
+        record_commission_expense,
+        record_tds_withheld,
+        record_platform_coupon_reimbursement,
+        record_loyalty_reimbursement,
+    )
+    from frappe.utils import flt, rounded
 
-        # TDS on commission (Income Tax Act s88): the vendor withholds 15%
-        # of the commission it pays the platform and deposits it with IRD.
-        tds_rate = flt(frappe.db.get_single_value("Vendor Config", "tds_rate") or 15.0)
-        record_tds_withheld(hub_order_id, commission_amount, tds_rate)
+    grand_total = payload.get("amount") or frappe.db.get_value(
+        "Vendor Order", hub_order_id, "grand_total"
+    )
+    # Vendor Config is a Single: get_value() with filters (even {}) targets
+    # the (nonexistent) table and crashes — its fields live in tabSingles.
+    # get_single_value() is the only correct read for a Single.
+    commission_pct = frappe.db.get_single_value("Vendor Config", "commission_pct") or 10
+    commission_amount = flt(grand_total) * flt(commission_pct) / 100
 
-        # Record platform coupon reimbursement (if any)
-        platform_coupon = payload.get("platform_coupon_amount", 0)
-        if flt(platform_coupon) > 0:
-            record_platform_coupon_reimbursement(hub_order_id, platform_coupon)
+    # Record commission expense
+    record_commission_expense(hub_order_id, commission_amount, commission_pct)
 
-        # Record loyalty reimbursement (if any)
-        loyalty_amount = payload.get("loyalty_amount", 0)
-        if flt(loyalty_amount) > 0:
-            record_loyalty_reimbursement(hub_order_id, loyalty_amount)
+    # TDS on commission (Income Tax Act s88): the vendor withholds 15%
+    # of the commission it pays the platform and deposits it with IRD.
+    tds_rate = flt(frappe.db.get_single_value("Vendor Config", "tds_rate") or 15.0)
+    record_tds_withheld(hub_order_id, commission_amount, tds_rate)
 
-    except Exception:
-        frappe.log_error(
-            frappe.get_traceback(),
-            f"Vendor accounting GL failed for {hub_order_id}"
-        )
+    # Record platform coupon reimbursement (if any)
+    platform_coupon = payload.get("platform_coupon_amount", 0)
+    if flt(platform_coupon) > 0:
+        record_platform_coupon_reimbursement(hub_order_id, platform_coupon)
+
+    # Record loyalty reimbursement (if any)
+    loyalty_amount = payload.get("loyalty_amount", 0)
+    if flt(loyalty_amount) > 0:
+        record_loyalty_reimbursement(hub_order_id, loyalty_amount)
 
 
 def _handle_settlement(payload):

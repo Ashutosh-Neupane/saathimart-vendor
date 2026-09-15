@@ -174,6 +174,25 @@ def create_gl_entry(account, debit=0, credit=0, voucher_type="Payment Entry",
             cost_center = _get_default_cost_center(company)
     if cost_center:
         gl.cost_center = cost_center
+    # Idempotency guard: identical (account, voucher, amount, remarks) rows
+    # must never double-book. Both event transports (webhook + Redis
+    # Streams) are at-least-once and can race the same order; without this
+    # a replayed delivery duplicates the voucher. Re-marking prevents the
+    # pair from being written twice within one uncommitted transaction too.
+    if frappe.db.exists("GL Entry", {
+        "voucher_no": voucher_no or "",
+        "account": account,
+        "debit": flt(debit, 2),
+        "credit": flt(credit, 2),
+        "remarks": remarks or "",
+    }):
+        return None
+    frappe.flags.setdefault("sm_gl_seen", set())
+    seen_key = (voucher_no or "", account, flt(debit, 2), flt(credit, 2), remarks or "")
+    if seen_key in frappe.flags.sm_gl_seen:
+        return None
+    frappe.flags.sm_gl_seen.add(seen_key)
+
     # ignore_links: GL entries may be created before the referenced voucher
     # is fully persisted (e.g. during a multi-step settlement flow).
     gl.insert(ignore_permissions=True, ignore_links=True)
@@ -336,11 +355,17 @@ def create_settlement_journal_entry(vendor_order_id, settlement_amount,
 
 def record_tds_withheld(vendor_order_id, commission_amount, tds_rate=15.0):
     """
-    DR: Marketplace Commission Expense (TDS portion — reduces net expense)
-    CR: TDS Payable                    (owed to IRD)
+    DR: SaathiMart Clearing   (platform's commission receivable shrinks — the
+                              15% the vendor withholds never leaves for the
+                              platform; it goes to IRD on the vendor's behalf)
+    CR: TDS Payable           (owed to IRD until the certificate settles it)
 
-    Net effect: commission expense shows gross, TDS Payable shows what the
-    vendor must deposit with IRD and certify to SaathiMart.
+    Net effect: commission expense still shows gross, TDS Payable shows what
+    the vendor must deposit with IRD, and the clearing balance drops by the
+    withheld amount — so settlement pays out cash minus TDS, exactly like
+    the hub's settlement JE expects. The previous version credited the
+    commission expense account a second time, which double-counted income
+    and left every TDS voucher unbalanced by exactly the TDS amount.
     """
     tds = rounded(flt(commission_amount) * flt(tds_rate) / 100.0, 2)
     if tds <= 0:
@@ -354,8 +379,8 @@ def record_tds_withheld(vendor_order_id, commission_amount, tds_rate=15.0):
         return
 
     tds_account = _get_account("tds_payable")
-    commission_account = _get_account("commission_expense")
-    if not (tds_account and commission_account):
+    clearing_account = _get_account("clearing_platform")
+    if not (tds_account and clearing_account):
         return
 
     create_gl_entries_batch([
@@ -366,9 +391,9 @@ def record_tds_withheld(vendor_order_id, commission_amount, tds_rate=15.0):
             "remarks": f"TDS withheld on SaathiMart commission for {vendor_order_id}",
         },
         {
-            "account": commission_account,
-            "debit": 0,
-            "credit": tds,
+            "account": clearing_account,
+            "debit": tds,
+            "credit": 0,
             "remarks": f"TDS withheld on commission (s88) for {vendor_order_id}",
         },
     ], voucher_type="Journal Entry",

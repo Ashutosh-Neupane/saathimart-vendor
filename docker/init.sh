@@ -137,7 +137,15 @@ config.hub_site = 'saathimart.localhost'
 config.vendor_id = vendor_id
 config.api_key = f'vendor-api-key-{vendor_id}'
 config.api_secret = f'vendor-api-secret-{vendor_id}'
-config.webhook_secret = webhook_secret
+# Preserve any per-vendor secret the hub has issued to this site (via the
+# registration handshake or a rotation). Overwriting it with the shared
+# bootstrap value on every boot used to break hub→vendor delivery until
+# someone manually re-propagated the secret — a restart wiped the real one.
+from frappe.utils.password import get_decrypted_password
+issued = get_decrypted_password('Vendor Config', 'Vendor Config',
+                                'webhook_secret', raise_exception=False) or ''
+if not issued or issued == webhook_secret:
+    config.webhook_secret = webhook_secret
 config.sync_enabled = 1
 config.reconciliation_enabled = 1
 
@@ -252,18 +260,73 @@ PYEOF
   cd "$BENCH"
 done
 
-# Sync vendor location to hub. Runs once, after every site above has been
-# created/configured — nesting this inside the site-provisioning loop
-# would (and used to) try to sync not-yet-created later sites too early.
-echo "Syncing vendor locations to hub..."
+# Register each vendor site with the hub, then sync its location. Runs once,
+# after every site above has been created/configured — nesting this inside
+# the site-provisioning loop would (and used to) try to sync not-yet-created
+# later sites too early.
+#
+# register_vendor closes the handshake gap: it tells the hub this site's URL
+# (so hub→vendor events have a delivery address) and fetches the per-vendor
+# webhook secret the hub issued (so the vendor's future pushes verify
+# per-vendor). Location sync then runs over the now-trusted channel.
+echo "Registering vendor sites with hub and syncing locations..."
 for SITE in $VENDOR_SITES; do
-  cd "$BENCH/sites" && "$BENCH/env/bin/python" - "$SITE" <<'PYEOF'
+  cd "$BENCH/sites" && "$BENCH/env/bin/python" - "$SITE" "$WEBHOOK_SECRET" <<'PYEOF'
 import sys
 site = sys.argv[1]
+webhook_secret = sys.argv[2]
 try:
     import frappe
     frappe.init(site, sites_path='/home/frappe/bench/sites')
     frappe.connect()
+    config = frappe.get_single('Vendor Config')
+
+    # 1. Register: exchange site URL + receive per-vendor secret.
+    #    Registration always signs with the shared bootstrap secret — it is
+    #    the one credential guaranteed to be known on both sides even after
+    #    a hub DB reset wipes the per-vendor secret. The hub's register
+    #    endpoint allows exactly this fallback; everything after it
+    #    (location sync, stock pushes, event delivery) verifies per-vendor.
+    import json as _json
+    import time as _time
+    import requests as _requests
+    from saathimart_vendor.utils import compute_hmac_signature
+    payload = {
+        'vendor_id': config.vendor_id,
+        'site_url': f'http://{site}',
+        'lat': config.lat,
+        'lng': config.lng,
+        'service_radius_km': config.service_radius_km,
+        'address': config.address or '',
+    }
+    body = _json.dumps(payload)
+    ts = str(int(_time.time()))
+    resp = _requests.post(
+        f'{config.hub_url}/api/method/saathimart.api.location.register_vendor',
+        data=body,
+        headers={
+            'X-Vendor-ID': config.vendor_id,
+            'X-SM-Timestamp': ts,
+            'X-SM-Signature': compute_hmac_signature(webhook_secret, ts, body),
+            'Content-Type': 'application/json',
+            'Host': config.hub_site or 'saathimart.localhost',
+        },
+        timeout=10,
+    )
+    try:
+        msg = resp.json().get('message')
+    except Exception:
+        msg = None
+    if resp.ok and isinstance(msg, dict) and msg.get('secret'):
+        from frappe.utils.password import set_encrypted_password
+        set_encrypted_password('Vendor Config', 'Vendor Config',
+                               msg['secret'], 'webhook_secret')
+        frappe.db.commit()
+        print(f'  Registered {site}: vendor={msg.get("vendor")}, secret stored')
+    else:
+        print(f'  Registration skipped for {site}: HTTP {resp.status_code}: {str(msg)[:200]}')
+
+    # 2. Sync location over the now-trusted channel.
     from saathimart_vendor.api.mapping import sync_vendor_location
     result = sync_vendor_location()
     print(f'  Location synced for {site}: {result}')
@@ -272,7 +335,7 @@ except Exception as e:
     # briefly unreachable) must never take down container startup — this
     # already happened once when a CWD bug here made frappe.connect() raise
     # and, under init.sh's `set -e`, killed the whole container in a loop.
-    print(f'  Location sync failed for {site}: {e}')
+    print(f'  Registration/sync failed for {site}: {e}')
 PYEOF
 done
 

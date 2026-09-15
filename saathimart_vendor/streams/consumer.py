@@ -109,12 +109,20 @@ class StreamConsumer:
             for stream_data in messages:
                 stream_name, msg_list = stream_data
                 for msg_id, fields in msg_list:
-                    # Convert [k1, v1, k2, v2, ...] to {k1: v1, k2: v2, ...}
-                    event_dict = {}
-                    for i in range(0, len(fields), 2):
-                        key = fields[i].decode() if isinstance(fields[i], bytes) else fields[i]
-                        value = fields[i + 1].decode() if isinstance(fields[i + 1], bytes) else fields[i + 1]
-                        event_dict[key] = value
+                    # redis-py ≥5 returns fields as a dict; older versions a
+                    # flat [k, v, k, v, ...] list — normalise both.
+                    if isinstance(fields, dict):
+                        event_dict = {
+                            (k.decode() if isinstance(k, bytes) else k):
+                            (v.decode() if isinstance(v, bytes) else v)
+                            for k, v in fields.items()
+                        }
+                    else:
+                        event_dict = {}
+                        for i in range(0, len(fields), 2):
+                            key = fields[i].decode() if isinstance(fields[i], bytes) else fields[i]
+                            value = fields[i + 1].decode() if isinstance(fields[i + 1], bytes) else fields[i + 1]
+                            event_dict[key] = value
                     
                     events.append((msg_id.decode() if isinstance(msg_id, bytes) else msg_id, event_dict))
             
@@ -168,44 +176,43 @@ class StreamConsumer:
             ...     consumer.acknowledge([msg_id])
         """
         try:
-            # XPENDING returns: [[msg_id, consumer, idle_time, deliveries], ...]
-            pending = self.redis.execute_command(
-                "XPENDING", self.stream_name, self.GROUP_NAME,
-                "-", "+", str(count)
+            # XAUTOCLAIM (Redis 6.2+) finds messages idle > min_idle_ms and
+            # transfers ownership to this consumer in ONE atomic call.
+            # The previous XPENDING(range)-then-XCLAIM approach crashed
+            # inside redis-py's response parser (its parse_xpending expects
+            # the SUMMARY form, not the range form) — the exception was
+            # swallowed by the handler below, so stuck-message recovery
+            # NEVER actually ran. XAUTOCLAIM needs no manual parsing of
+            # pending entries at all.
+            result = self.redis.execute_command(
+                "XAUTOCLAIM", self.stream_name, self.GROUP_NAME,
+                self.consumer_id, str(min_idle_ms), "0", "COUNT", str(count)
             )
-            
-            if not pending:
+
+            # Returns [next_cursor, [[msg_id, fields], ...], [deleted_ids]]
+            if not result or len(result) < 2 or not result[1]:
                 return []
-            
-            # Find messages idle > min_idle_ms
-            idle_ids = []
-            for msg in pending:
-                msg_id, consumer, idle_time, deliveries = msg
-                if isinstance(msg_id, bytes):
-                    msg_id = msg_id.decode()
-                if idle_time >= min_idle_ms:
-                    idle_ids.append(msg_id)
-            
-            if not idle_ids:
-                return []
-            
-            # XCLAIM transfers ownership to this consumer
-            claimed = self.redis.execute_command(
-                "XCLAIM", self.stream_name, self.GROUP_NAME, self.consumer_id,
-                str(min_idle_ms), *idle_ids
-            )
-            
-            if not claimed:
-                return []
-            
-            # Parse claimed messages
+
+            claimed = result[1]
+
+            # Parse claimed messages — fields may be a flat [k, v, ...]
+            # list (decode_responses=False) or a dict depending on the
+            # redis-py version.
             events = []
-            for msg_id, fields in claimed:
+            for item in claimed:
+                msg_id, fields = item[0], item[1]
                 event_dict = {}
-                for i in range(0, len(fields), 2):
-                    key = fields[i].decode() if isinstance(fields[i], bytes) else fields[i]
-                    value = fields[i + 1].decode() if isinstance(fields[i + 1], bytes) else fields[i + 1]
-                    event_dict[key] = value
+                if isinstance(fields, dict):
+                    event_dict = {
+                        (k.decode() if isinstance(k, bytes) else k):
+                        (v.decode() if isinstance(v, bytes) else v)
+                        for k, v in fields.items()
+                    }
+                else:
+                    for i in range(0, len(fields), 2):
+                        key = fields[i].decode() if isinstance(fields[i], bytes) else fields[i]
+                        value = fields[i + 1].decode() if isinstance(fields[i + 1], bytes) else fields[i + 1]
+                        event_dict[key] = value
                 
                 events.append((msg_id.decode() if isinstance(msg_id, bytes) else msg_id, event_dict))
             
