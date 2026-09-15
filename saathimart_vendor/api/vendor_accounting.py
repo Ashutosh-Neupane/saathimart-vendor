@@ -110,6 +110,15 @@ def _get_account(account_key):
         _account_cache[cache_key] = found
         return found
 
+    # Marketplace-specific accounts: provision on demand BEFORE the fuzzy
+    # fallback — fuzzy matching for e.g. clearing_platform would otherwise
+    # degrade to Debtors (a Receivable, wrong type: ERPNext then demands a
+    # Customer party and settlement clearing breaks).
+    provisioned = _provision_account(account_key, company)
+    if provisioned:
+        _account_cache[cache_key] = provisioned
+        return provisioned
+
     # Fuzzy fallback — prefer non-group, still company-scoped
     for keyword in _FUZZY_FALLBACKS.get(account_key, []):
         found = frappe.db.get_value(
@@ -127,6 +136,98 @@ def _get_account(account_key):
 
 # Per-company account resolution cache (see _get_account)
 _account_cache: dict = {}
+
+
+# ── Marketplace chart provisioning ───────────────────────────────────────────
+# Standard ERPNext charts have no marketplace accounts (SaathiMart Clearing,
+# TDS Payable on commission, marketplace commission expense...). Without them
+# _get_account used to silently degrade: clearing fell back to Debtors (a
+# Receivable — ERPNext then demands a Customer party on every GL row) and
+# TDS Payable resolved to None, dropping the withholding booking entirely.
+# These keys are provisioned on demand under the correct parents instead.
+#
+# SaathiMart Clearing is deliberately a plain Current Asset, NOT a
+# Receivable — the platform is not a ERPNext "Customer"; it is a clearing
+# counterparty whose balance nets against settlement payouts.
+_PROVISIONABLE = {
+    "clearing_platform": {
+        "account_name": "SaathiMart Clearing",
+        "parents": ["Current Assets", "Current Asset"],
+        "root_type": "Asset",
+        "account_type": None,
+    },
+    "tds_payable": {
+        "account_name": "TDS Payable",
+        "parents": ["Duties and Taxes", "Current Liabilities"],
+        "root_type": "Liability",
+        "account_type": "Tax",
+    },
+    "vat_output": {
+        "account_name": "Output VAT",
+        "parents": ["Duties and Taxes", "Current Liabilities"],
+        "root_type": "Liability",
+        "account_type": "Tax",
+    },
+    "commission_expense": {
+        "account_name": "Marketplace Commission",
+        "parents": ["Indirect Expenses", "Direct Expenses", "Expenses"],
+        "root_type": "Expense",
+        "account_type": "Expense Account",
+    },
+    "platform_coupon_income": {
+        "account_name": "Platform Coupon Reimbursement",
+        "parents": ["Indirect Income", "Direct Income", "Income"],
+        "root_type": "Income",
+        "account_type": "Income Account",
+    },
+    "loyalty_income": {
+        "account_name": "Loyalty Reimbursement",
+        "parents": ["Indirect Income", "Direct Income", "Income"],
+        "root_type": "Income",
+        "account_type": "Income Account",
+    },
+}
+
+
+def _provision_account(account_key: str, company: str) -> str | None:
+    """Create a missing marketplace account under the right parent group."""
+    spec = _PROVISIONABLE.get(account_key)
+    if not spec:
+        return None
+
+    parent = None
+    for parent_name in spec["parents"]:
+        parent = frappe.db.get_value(
+            "Account",
+            {"account_name": ["like", f"{parent_name}%"], "is_group": 1, "company": company},
+            "name",
+        )
+        if parent:
+            break
+    if not parent:
+        return None
+
+    try:
+        acc = frappe.new_doc("Account")
+        acc.account_name = spec["account_name"]
+        acc.company = company
+        acc.parent_account = parent
+        acc.is_group = 0
+        acc.root_type = spec["root_type"]
+        acc.report_type = (
+            "Profit and Loss" if spec["root_type"] in ("Income", "Expense")
+            else "Balance Sheet"
+        )
+        if spec["account_type"]:
+            acc.account_type = spec["account_type"]
+        acc.insert(ignore_permissions=True)
+        return acc.name
+    except Exception:
+        frappe.log_error(
+            frappe.get_traceback(),
+            f"provision_account failed: {spec['account_name']} for {company}",
+        )
+        return None
 
 
 def _get_company():
@@ -225,17 +326,24 @@ def create_gl_entries_batch(entries, voucher_type="Payment Entry", voucher_no=""
 # The platform coupon and loyalty points are NOT deducted from taxable base
 # because SaathiMart will reimburse the vendor for them.
 
-def create_vendor_sales_invoice_gl(vendor_order_id, items, grand_total, tax_amount=0):
+def create_vendor_sales_invoice_gl(vendor_order_id, grand_total, tax_amount=0):
     """
     Create GL Entries for vendor's Sales Invoice to customer.
-    
+
     Taxable Product Base = Sum of item amounts (vendor coupon deducted, platform coupon NOT)
     Product VAT = 13% of taxable base
     Total Product Gross Receivable = Taxable + VAT
-    
+
     DR: SaathiMart Clearing Account (amount owed by platform)
     CR: Product Sales Revenue
     CR: Output VAT Liability
+
+    Fail-closed: all legs are resolved BEFORE anything is written.
+    create_gl_entry posts raw GL documents with no debit=credit
+    enforcement, and _get_account reports unresolvable accounts via
+    log_error instead of raising — a leg-by-leg guard could therefore
+    post DR clearing with no matching credits (books silently broken).
+    If any required leg cannot be resolved, NOTHING posts.
     """
     # Avoid double-entry
     if frappe.db.exists("GL Entry", {
@@ -244,22 +352,54 @@ def create_vendor_sales_invoice_gl(vendor_order_id, items, grand_total, tax_amou
     }):
         return
 
-    entries = []
-    posting_date = nowdate()
-
-    # Revenue credit
+    # ── Fail-closed pre-check: resolve every required leg first ──────────
+    clearing_account = _get_account("clearing_platform")
     revenue_account = _get_account("revenue")
-    if revenue_account:
-        entries.append({
+    if not (clearing_account and revenue_account):
+        frappe.log_error(
+            f"Sales invoice GL for {vendor_order_id} aborted: "
+            f"clearing={clearing_account}, revenue={revenue_account} "
+            f"(company {_get_company()}) — nothing posted (fail-closed)",
+            "Vendor Accounting",
+        )
+        return
+
+    vat_account = None
+    if flt(tax_amount, 2) > 0:
+        vat_account = _get_account("vat_output")
+        if not vat_account:
+            frappe.log_error(
+                f"Sales invoice GL for {vendor_order_id} aborted: no Output VAT "
+                f"account (company {_get_company()}) — nothing posted (fail-closed)",
+                "Vendor Accounting",
+            )
+            return
+
+    # ── Build all legs (amounts derived from the SAME grand_total) ───────
+    taxable_value = rounded(flt(grand_total, 2) - flt(tax_amount, 2), 2)
+    if taxable_value < 0:
+        frappe.log_error(
+            f"Sales invoice GL for {vendor_order_id} aborted: VAT {tax_amount} "
+            f"exceeds grand_total {grand_total} — nothing posted (fail-closed)",
+            "Vendor Accounting",
+        )
+        return
+
+    entries = [
+        {
+            "account": clearing_account,
+            "debit": flt(grand_total, 2),
+            "credit": 0,
+            "remarks": f"Receivable from SaathiMart for {vendor_order_id}",
+        },
+        {
             "account": revenue_account,
             "debit": 0,
-            "credit": flt(grand_total - tax_amount, 2),
+            "credit": taxable_value,
             "remarks": f"Sales from {vendor_order_id}",
-        })
-
-    # VAT credit
-    vat_account = _get_account("vat_output")
-    if vat_account and tax_amount > 0:
+        },
+    ]
+    if flt(tax_amount, 2) > 0:
         entries.append({
             "account": vat_account,
             "debit": 0,
@@ -267,24 +407,27 @@ def create_vendor_sales_invoice_gl(vendor_order_id, items, grand_total, tax_amou
             "remarks": f"Output VAT for {vendor_order_id}",
         })
 
-    # Clearing Account debit (platform owes this to vendor)
-    clearing_account = _get_account("clearing_platform")
-    if clearing_account:
-        entries.append({
-            "account": clearing_account,
-            "debit": flt(grand_total, 2),
-            "credit": 0,
-            "remarks": f"Receivable from SaathiMart for {vendor_order_id}",
-        })
+    # ── Hard balance assertion: never post one-sided GL rows ─────────────
+    total_dr = sum(flt(e["debit"]) for e in entries)
+    total_cr = sum(flt(e["credit"]) for e in entries)
+    if abs(total_dr - total_cr) > 0.05:
+        frappe.log_error(
+            f"Sales invoice GL for {vendor_order_id} aborted: unbalanced "
+            f"Dr {total_dr} vs Cr {total_cr} — nothing posted (fail-closed)",
+            "Vendor Accounting",
+        )
+        return
 
-    if entries:
-        create_gl_entries_batch(
-            entries,
-            voucher_type="Sales Invoice",
-            voucher_no=vendor_order_id,
-            remarks=f"Vendor sales invoice for {vendor_order_id}",
-            posting_date=posting_date,
-        )# ── Settlement Journal Entry ────────────────────────────────────────────────
+    create_gl_entries_batch(
+        entries,
+        voucher_type="Sales Invoice",
+        voucher_no=vendor_order_id,
+        remarks=f"Vendor sales invoice for {vendor_order_id}",
+        posting_date=nowdate(),
+    )
+
+
+# ── Settlement Journal Entry ────────────────────────────────────────────────
 # When the platform pays (settles) the vendor — this is when cash actually
 # moves. The payment.received event does NOT create a Payment Entry because
 # the vendor never receives cash from the customer directly.

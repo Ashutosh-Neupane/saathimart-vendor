@@ -466,6 +466,7 @@ def record_payment_accounting(hub_order_id, payload):
         record_tds_withheld,
         record_platform_coupon_reimbursement,
         record_loyalty_reimbursement,
+        create_vendor_sales_invoice_gl,
     )
     from frappe.utils import flt, rounded
 
@@ -495,6 +496,29 @@ def record_payment_accounting(hub_order_id, payload):
     loyalty_amount = payload.get("loyalty_amount", 0)
     if flt(loyalty_amount) > 0:
         record_loyalty_reimbursement(hub_order_id, loyalty_amount)
+
+    # ── The sale itself: revenue + Output VAT (the vendor's tax invoice GL)
+    # The hub computes the per-vendor tax slice (vendor coupon reduces the
+    # taxable base; platform coupon and loyalty do not — they are reimbursed).
+    # GL entries only — no Sales Invoice document, no legal numbering: tax
+    # invoices and CBMS reporting belong to the CBMS integration app.
+    # Guarded: old in-flight payloads without tax fields fall back to the
+    # 13% price-inclusive back-out of the vendor's gross; zero-amount slices
+    # (pure cancellations) are skipped; the GL guard in create_gl_entry
+    # makes replays from either transport no-ops.
+    tax_amount = payload.get("tax_amount")
+    taxable_value = payload.get("taxable_value")
+    if taxable_value is None and tax_amount is None:
+        # Pre-tax-payload event (back-compat): derive from the vendor slice.
+        base = max(flt(grand_total), 0.0)
+        taxable_value = rounded(base / 1.13, 2)
+        tax_amount = rounded(base - taxable_value, 2)
+    if flt(taxable_value) + flt(tax_amount) > 0:
+        create_vendor_sales_invoice_gl(
+            vendor_order_id=hub_order_id,
+            grand_total=flt(taxable_value) + flt(tax_amount),
+            tax_amount=flt(tax_amount),
+        )
 
 
 def _handle_settlement(payload):
