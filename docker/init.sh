@@ -181,8 +181,20 @@ config.service_radius_km = 5
 # vendor's stock" isn't a valid substitute. If this vendor already has a
 # real warehouse (a pre-existing site with its own Company), use that
 # instead of ever touching/creating our own.
-existing_warehouse = frappe.db.get_value(
-    'Warehouse', {'disabled': 0}, 'name', order_by='creation asc'
+# Leaf warehouses only, Stores named first: Company creation seeds the
+# group warehouse 'All Warehouses - {abbr}' *before* any leaf warehouse,
+# so ordering by creation alone always picked the group node — a Bin can
+# never exist there, and every re-registration silently reset stock
+# reading/order fulfillment to a warehouse that can't hold stock.
+existing_warehouse = (
+    frappe.db.get_value(
+        'Warehouse',
+        {'disabled': 0, 'is_group': 0, 'warehouse_name': ['like', '%Stores%']},
+        'name',
+    )
+    or frappe.db.get_value(
+        'Warehouse', {'disabled': 0, 'is_group': 0}, 'name', order_by='creation asc'
+    )
 )
 
 if existing_warehouse:

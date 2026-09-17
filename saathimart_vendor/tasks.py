@@ -404,11 +404,15 @@ def _reconcile_item(config, mapping, batch_result=None):
             pass
 
     drift = actual_qty - hub_physical
-    threshold = float(config.reconciliation_threshold or 2)
-    threshold_pct = float(config.reconciliation_threshold_pct or 5)
+    # Contract threshold lives on the hub's Vendor row (reconciliation_
+    # threshold_pct) — the vendor-side Vendor Config copy was removed when
+    # rates/thresholds moved to the hub. Pct-only: the hub's own corrector
+    # uses the same shape (max(pct of qty, 1-unit floor)), so both sides
+    # agree on when drift is worth a message.
+    threshold_pct = float(getattr(config, "reconciliation_threshold_pct", 0) or 5)
     pct_drift = abs(drift / hub_physical * 100) if hub_physical else 100.0
 
-    if abs(drift) > threshold or pct_drift > threshold_pct:
+    if pct_drift > threshold_pct:
         enqueue_outbox(
             event_type="stock.adjustment",
             payload={
