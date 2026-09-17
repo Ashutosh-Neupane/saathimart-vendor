@@ -14,7 +14,10 @@ import time
 import frappe
 from frappe import _
 from frappe.utils import flt, now_datetime
-from saathimart_vendor.utils import get_config, VALID_TRANSITIONS, hub_get, hub_post
+from saathimart_vendor.utils import (
+    get_config, VALID_TRANSITIONS, hub_get, hub_post,
+    enqueue_outbox, generate_event_id, next_event_seq,
+)
 
 
 def _validate_transition(old_status, new_status):
@@ -124,6 +127,19 @@ def receive_from_hub(event=None, payload=None):
     if isinstance(payload, str):
         payload = json.loads(payload)
     payload = payload or {}
+
+    # frappe.local.lang is normally populated from the logged-in user's
+    # language preference — an allow_guest=True request like this one has
+    # no such user, and it comes back unset (not even a safe default).
+    # frappe.locale.get_number_format() -> get_locale_value() then hits a
+    # genuine UnboundLocalError deep in frappe's own code (not caught,
+    # not logged there) the moment any handler on this path creates or
+    # saves a document whose precision resolution touches currency
+    # formatting — e.g. every Journal Entry record_payment_accounting /
+    # create_settlement_journal_entry / create_platform_gl_entries build.
+    # Confirmed live: calling dispatch_event with lang unset reproduces it
+    # on every run; setting it first does not.
+    frappe.local.lang = frappe.local.lang or frappe.db.get_default("lang") or "en"
 
     try:
         dispatch_event(event, payload)
@@ -465,70 +481,110 @@ def _handle_payment_received(payload):
     doc.payment_reference = payload.get("reference") or doc.payment_reference or ""
     doc.save(ignore_permissions=True)
 
-    # Shared idempotent accounting — used by BOTH the webhook transport
-    # (receive_from_hub) and the Redis Streams transport (streams.processor).
-    # Centralised so neither path can drift: whichever arrives first does
-    # the work, the other is a no-op. Guards live inside (order-level
-    # status flip + per-voucher GL existence checks), so at-least-once
-    # delivery on either transport can never double-book.
+    # Idempotent accounting — guards live inside (order-level status flip +
+    # per-voucher GL existence checks), so at-least-once webhook delivery
+    # (a retried callback, a replayed event) can never double-book.
     record_payment_accounting(hub_order_id, payload)
 
 
 def record_payment_accounting(hub_order_id, payload):
-    """One-shot accounting for a fully-paid order (idempotent)."""
+    """One-shot accounting for a fully-paid order (idempotent).
+
+    Books commission expense + input VAT, TDS withheld, and the sale itself
+    (revenue + output VAT) as ONE real, submitted Journal Entry — not three
+    (or more) raw GL Entry writes fabricating their own voucher_type/
+    voucher_no. A raw insert claiming voucher_type="Journal Entry" with no
+    actual Journal Entry document by that name displays correctly in the
+    General Ledger report (once the *_in_account_currency columns are set)
+    but can never be opened from it, never shows up in the Journal Entry
+    list, and has no real submit/cancel lifecycle — exactly the "looks
+    booked, isn't a real voucher" problem this function used to have.
+    """
     from saathimart_vendor.api.vendor_accounting import (
-        record_commission_expense,
-        record_tds_withheld,
-        create_vendor_sales_invoice_gl,
+        commission_expense_entries,
+        tds_withheld_entries,
+        sales_invoice_gl_entries,
+        _get_company,
     )
     from frappe.utils import flt, rounded
+
+    # Idempotent per order — same convention as create_platform_gl_entries's
+    # sm_hub_ref, scoped to this order rather than a hub event_id since a
+    # payment is only ever recorded once per order regardless of which
+    # transport (webhook or Redis Streams) got there first.
+    hub_ref = f"payment.received:{hub_order_id}"
+    if frappe.db.exists("Journal Entry", {"sm_hub_ref": hub_ref}):
+        return
 
     grand_total = payload.get("amount") or frappe.db.get_value(
         "Vendor Order", hub_order_id, "grand_total"
     )
-    # Vendor Config is a Single: get_value() with filters (even {}) targets
-    # the (nonexistent) table and crashes — its fields live in tabSingles.
-    # get_single_value() is the only correct read for a Single.
-    commission_pct = frappe.db.get_single_value("Vendor Config", "commission_pct") or 10
+    # Contract rates come from the hub (Vendor.commission_pct / tds_rate on
+    # the hub's Vendor row, pushed with the event) — Vendor Config no longer
+    # carries a local copy of platform pricing. Back-compat defaults keep old
+    # in-flight events (no rate fields) booking at the 10% / 15% convention.
+    commission_pct = flt(payload.get("commission_pct") or 0) or 10.0
     commission_amount = flt(grand_total) * flt(commission_pct) / 100
-
-    # Record commission expense
-    record_commission_expense(hub_order_id, commission_amount, commission_pct)
-
-    # TDS on commission (Income Tax Act s88): the vendor withholds 15%
-    # of the commission it pays the platform and deposits it with IRD.
-    tds_rate = flt(frappe.db.get_single_value("Vendor Config", "tds_rate") or 15.0)
-    record_tds_withheld(hub_order_id, commission_amount, tds_rate)
+    tds_rate = flt(payload.get("tds_rate") or 0) or 15.0
 
     # NOTE: platform-coupon and loyalty reimbursement rows are deliberately
-    # NOT booked here any more. The sale below is posted at the FULL
-    # VAT-inclusive product base, so platform-funded discounts are already
-    # inside the SaathiMart Clearing receivable — booking separate
-    # reimbursement income rows double-counted them and inflated the
-    # settlement payout. The platform covers the funded gap at settlement.
+    # NOT booked here. The sale below is posted at the FULL VAT-inclusive
+    # product base, so platform-funded discounts are already inside the
+    # SaathiMart Clearing receivable — booking separate reimbursement income
+    # rows would double-count them and inflate the settlement payout. The
+    # platform covers the funded gap at settlement.
 
-    # ── The sale itself: revenue + Output VAT (the vendor's tax invoice GL)
+    # The sale itself: revenue + Output VAT (the vendor's tax invoice GL).
     # The hub computes the per-vendor tax slice (vendor coupon reduces the
-    # taxable base; platform coupon and loyalty do not — they are reimbursed).
-    # GL entries only — no Sales Invoice document, no legal numbering: tax
-    # invoices and CBMS reporting belong to the CBMS integration app.
-    # Guarded: old in-flight payloads without tax fields fall back to the
-    # 13% price-inclusive back-out of the vendor's gross; zero-amount slices
-    # (pure cancellations) are skipped; the GL guard in create_gl_entry
-    # makes replays from either transport no-ops.
+    # taxable base; platform coupon and loyalty do not). Old in-flight
+    # payloads without tax fields fall back to a 13% price-inclusive
+    # back-out of the vendor's gross.
     tax_amount = payload.get("tax_amount")
     taxable_value = payload.get("taxable_value")
     if taxable_value is None and tax_amount is None:
-        # Pre-tax-payload event (back-compat): derive from the vendor slice.
         base = max(flt(grand_total), 0.0)
         taxable_value = rounded(base / 1.13, 2)
         tax_amount = rounded(base - taxable_value, 2)
+
+    entries = []
+    entries += commission_expense_entries(hub_order_id, commission_amount, commission_pct)
+    entries += tds_withheld_entries(hub_order_id, commission_amount, tds_rate)
     if flt(taxable_value) + flt(tax_amount) > 0:
-        create_vendor_sales_invoice_gl(
+        entries += sales_invoice_gl_entries(
             vendor_order_id=hub_order_id,
             grand_total=flt(taxable_value) + flt(tax_amount),
             tax_amount=flt(tax_amount),
         )
+
+    if not entries:
+        return
+
+    total_dr = rounded(sum(flt(e["debit"]) for e in entries), 2)
+    total_cr = rounded(sum(flt(e["credit"]) for e in entries), 2)
+    if abs(total_dr - total_cr) > 0.05:
+        frappe.log_error(
+            f"payment.received accounting for {hub_order_id} UNBALANCED: "
+            f"Dr {total_dr} vs Cr {total_cr} — nothing posted (fail-closed)",
+            "Vendor Accounting",
+        )
+        return
+
+    je = frappe.new_doc("Journal Entry")
+    je.company = _get_company()
+    je.entry_type = "Journal Entry"
+    je.posting_date = frappe.utils.nowdate()
+    je.cheque_no = hub_order_id
+    je.cheque_date = je.posting_date
+    je.user_remark = f"SaathiMart order {hub_order_id} — commission, TDS and sale booking"[:300]
+    je.sm_hub_ref = hub_ref
+    for e in entries:
+        row = je.append("accounts", {})
+        row.account = e["account"]
+        row.debit_in_account_currency = flt(e.get("debit", 0), 2)
+        row.credit_in_account_currency = flt(e.get("credit", 0), 2)
+        row.user_remark = e.get("remarks") or ""
+    je.insert(ignore_permissions=True)
+    je.submit()
 
 
 def _handle_settlement(payload):
@@ -558,13 +614,11 @@ def _handle_settlement(payload):
         )
         return
 
-    # Idempotent — skip if we already recorded this settlement
-    if frappe.db.exists("GL Entry", {
-        "voucher_no": payout_id,
-        "voucher_type": "Journal Entry",
-        "remarks": ["like", "%Settlement%"],
-    }):
-        return
+    # Idempotency now lives inside create_settlement_journal_entry itself
+    # (sm_hub_ref on the real Journal Entry it creates) — this used to
+    # duplicate that check against a raw GL Entry pattern the function no
+    # longer writes, which would just never match and silently stop
+    # guarding anything.
 
     try:
         from saathimart_vendor.api.vendor_accounting import (

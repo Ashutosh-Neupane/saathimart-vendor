@@ -7,7 +7,7 @@
   {
    "fieldname": "section_hub",
    "fieldtype": "Section Break",
-   "label": "🔗 Hub Connection"
+   "label": "\ud83d\udd17 Hub Connection"
   },
   {
    "fieldname": "hub_url",
@@ -22,7 +22,7 @@
    "label": "Hub Site",
    "reqd": 1,
    "default": "saathimart.localhost",
-   "description": "Frappe site name on the hub bench, sent as the Host header — hub_url is often a Docker service name (e.g. http://hub:8000), which is not itself a valid Frappe site"
+   "description": "Frappe site name on the hub bench, sent as the Host header \u2014 hub_url is often a Docker service name (e.g. http://hub:8000), which is not itself a valid Frappe site"
   },
   {
    "fieldname": "vendor_id",
@@ -78,7 +78,7 @@
    "fieldtype": "Data",
    "label": "Hub Status",
    "read_only": 1,
-   "description": "Active / Unreachable — updated every 5 min"
+   "description": "Active / Unreachable \u2014 updated every 5 min"
   },
   {
    "fieldname": "last_sync_at",
@@ -109,7 +109,7 @@
   {
    "fieldname": "section_warehouse",
    "fieldtype": "Section Break",
-   "label": "🏭 Warehouse"
+   "label": "\ud83c\udfed Warehouse"
   },
   {
    "fieldname": "warehouses",
@@ -132,7 +132,7 @@
   {
    "fieldname": "section_location",
    "fieldtype": "Section Break",
-   "label": "📍 Location"
+   "label": "\ud83d\udccd Location"
   },
   {
    "fieldname": "lat",
@@ -160,7 +160,7 @@
   {
    "fieldname": "section_reconciliation",
    "fieldtype": "Section Break",
-   "label": "⚖️ Reconciliation"
+   "label": "\u2696\ufe0f Reconciliation"
   },
   {
    "fieldname": "reconciliation_enabled",
@@ -174,20 +174,6 @@
    "label": "Drift Threshold (%)",
    "default": "5",
    "description": "Maximum percentage drift allowed before creating stock adjustment event"
-  },
-  {
-   "fieldname": "commission_pct",
-   "fieldtype": "Float",
-   "label": "SaathiMart Commission %",
-   "default": "10",
-   "description": "Commission this vendor pays the platform on hub orders (agreed contract rate)"
-  },
-  {
-   "fieldname": "tds_rate",
-   "fieldtype": "Float",
-   "label": "TDS Rate on Commission %",
-   "default": "15",
-   "description": "Withholding rate applied to the SaathiMart commission under Income Tax Act 2058 s88 — vendor deposits it with IRD and certifies it to the platform"
   }
  ],
  "permissions": [

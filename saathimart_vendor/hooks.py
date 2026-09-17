@@ -13,6 +13,12 @@ required_apps = ["frappe", "erpnext"]
 # in ERPNext. Every stock transaction (Purchase Receipt, Sales Invoice,
 # Stock Entry, Delivery Note, Stock Reconciliation, Manufacturing, etc.)
 # creates SLE records. Hooking into SLE catches everything.
+# ── Item form "Sync to Saathi" button ────────────────────────────────
+# doctype_js: JS loaded into ERPNext's Item form; the button calls
+# saathimart_vendor.api.item_sync.sync_item_to_saathi (see that module's
+# docstring for the one-click flow: mapping + hub Product/Listing/stock).
+doctype_js = {"Item": ["doctype_js/item.js"]}
+
 doc_events = {
     "Stock Ledger Entry": {
         "on_submit": "saathimart_vendor.event_handlers.stock.on_stock_ledger_entry_submit",
@@ -42,13 +48,16 @@ doc_events = {
     },
 }
 
+# ── Custom fields ────────────────────────────────────────────────────────────
+# sm_hub_ref on Journal Entry: the hub's platform.ledger_entry batches are
+# keyed by the hub's own event_id; the receiver dedupes re-deliveries on
+# this column so at-least-once delivery can never double-book the
+# platform's books. Fields themselves are created in setup.py.
+after_migrate = "saathimart_vendor.setup.ensure_custom_fields"
+
+
 # ── Scheduled tasks ───────────────────────────────────────────────────
 scheduler_events = {
-    "all": [
-        # Redis Streams consumer - processes events from hub every 4 minutes
-        # Uses consumer groups for parallel processing and automatic retry
-        "saathimart_vendor.streams.worker.consume_hub_events",
-    ],
     "daily": [
         "saathimart_vendor.tasks.archive_old_outbox",
     ],

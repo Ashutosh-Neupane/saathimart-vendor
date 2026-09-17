@@ -359,10 +359,34 @@ def _get_default_cost_center(company):
     return cc
 
 
+def _currency_for_account(account):
+    """The currency GL rows must carry for this account.
+
+    ERPNext's account-facing reports (General Ledger, Accounts Balance,
+    every receivable/payable view) display debit_in_account_currency —
+    NOT debit. A raw-inserted GL row without these columns reads as a
+    perfectly booked voucher showing 0.00 everywhere. Real controllers
+    fill them in validate(); raw writers must do it themselves.
+    """
+    if not account:
+        return None
+    cur = frappe.db.get_value("Account", account, "account_currency")
+    if cur:
+        return cur
+    company = _get_company()
+    return frappe.db.get_value("Company", company, "default_currency")
+
+
 def create_gl_entry(account, debit=0, credit=0, voucher_type="Payment Entry",
                     voucher_no="", remarks="", party_type=None, party=None,
                     posting_date=None, cost_center=None):
-    """Create a single GL Entry."""
+    """Create a single GL Entry.
+
+    Also fills account_currency and debit/credit_in_account_currency —
+    the GL report shows the in-account-currency columns, so a raw row
+    without them displays as 0.00 Dr/Cr even though `debit` is correct
+    (this was the 'General Ledger all zeros' bug on main.localhost).
+    """
     company = _get_company()
     if not company:
         return None
@@ -388,6 +412,13 @@ def create_gl_entry(account, debit=0, credit=0, voucher_type="Payment Entry",
             cost_center = _get_default_cost_center(company)
     if cost_center:
         gl.cost_center = cost_center
+    # Currency columns — the General Ledger report renders the
+    # *_in_account_currency pair, not the raw debit/credit pair.
+    gl.account_currency = _currency_for_account(account)
+    if flt(debit, 2) > 0:
+        gl.debit_in_account_currency = flt(debit, 2)
+    if flt(credit, 2) > 0:
+        gl.credit_in_account_currency = flt(credit, 2)
     # Idempotency guard: identical (account, voucher, amount, remarks) rows
     # must never double-book. Both event transports (webhook + Redis
     # Streams) are at-least-once and can race the same order; without this
@@ -439,9 +470,9 @@ def create_gl_entries_batch(entries, voucher_type="Payment Entry", voucher_no=""
 # The platform coupon and loyalty points are NOT deducted from taxable base
 # because SaathiMart will reimburse the vendor for them.
 
-def create_vendor_sales_invoice_gl(vendor_order_id, grand_total, tax_amount=0):
+def sales_invoice_gl_entries(vendor_order_id, grand_total, tax_amount=0):
     """
-    Create GL Entries for vendor's Sales Invoice to customer.
+    Build (never write) the GL legs for the vendor's sale of this order:
 
     Taxable Product Base = Sum of item amounts (vendor coupon deducted, platform coupon NOT)
     Product VAT = 13% of taxable base
@@ -451,21 +482,12 @@ def create_vendor_sales_invoice_gl(vendor_order_id, grand_total, tax_amount=0):
     CR: Product Sales Revenue
     CR: Output VAT Liability
 
-    Fail-closed: all legs are resolved BEFORE anything is written.
-    create_gl_entry posts raw GL documents with no debit=credit
-    enforcement, and _get_account reports unresolvable accounts via
-    log_error instead of raising — a leg-by-leg guard could therefore
-    post DR clearing with no matching credits (books silently broken).
-    If any required leg cannot be resolved, NOTHING posts.
+    Returns `[]` (never partial) if any required account can't be
+    resolved or the legs don't balance — the caller (record_payment_accounting)
+    combines this with the commission/TDS legs into one Journal Entry, so a
+    partial return here would silently post an unbalanced voucher through
+    no fault of the caller's own logic.
     """
-    # Avoid double-entry
-    if frappe.db.exists("GL Entry", {
-        "voucher_no": vendor_order_id,
-        "voucher_type": "Sales Invoice",
-    }):
-        return
-
-    # ── Fail-closed pre-check: resolve every required leg first ──────────
     clearing_account = _get_account("clearing_platform")
     revenue_account = _get_account("revenue")
     if not (clearing_account and revenue_account):
@@ -475,7 +497,7 @@ def create_vendor_sales_invoice_gl(vendor_order_id, grand_total, tax_amount=0):
             f"(company {_get_company()}) — nothing posted (fail-closed)",
             "Vendor Accounting",
         )
-        return
+        return []
 
     vat_account = None
     if flt(tax_amount, 2) > 0:
@@ -486,9 +508,8 @@ def create_vendor_sales_invoice_gl(vendor_order_id, grand_total, tax_amount=0):
                 f"account (company {_get_company()}) — nothing posted (fail-closed)",
                 "Vendor Accounting",
             )
-            return
+            return []
 
-    # ── Build all legs (amounts derived from the SAME grand_total) ───────
     taxable_value = rounded(flt(grand_total, 2) - flt(tax_amount, 2), 2)
     if taxable_value < 0:
         frappe.log_error(
@@ -496,7 +517,7 @@ def create_vendor_sales_invoice_gl(vendor_order_id, grand_total, tax_amount=0):
             f"exceeds grand_total {grand_total} — nothing posted (fail-closed)",
             "Vendor Accounting",
         )
-        return
+        return []
 
     entries = [
         {
@@ -520,7 +541,6 @@ def create_vendor_sales_invoice_gl(vendor_order_id, grand_total, tax_amount=0):
             "remarks": f"Output VAT for {vendor_order_id}",
         })
 
-    # ── Hard balance assertion: never post one-sided GL rows ─────────────
     total_dr = sum(flt(e["debit"]) for e in entries)
     total_cr = sum(flt(e["credit"]) for e in entries)
     if abs(total_dr - total_cr) > 0.05:
@@ -529,15 +549,9 @@ def create_vendor_sales_invoice_gl(vendor_order_id, grand_total, tax_amount=0):
             f"Dr {total_dr} vs Cr {total_cr} — nothing posted (fail-closed)",
             "Vendor Accounting",
         )
-        return
+        return []
 
-    create_gl_entries_batch(
-        entries,
-        voucher_type="Sales Invoice",
-        voucher_no=vendor_order_id,
-        remarks=f"Vendor sales invoice for {vendor_order_id}",
-        posting_date=nowdate(),
-    )
+    return entries
 
 
 # ── Settlement Journal Entry ────────────────────────────────────────────────
@@ -549,11 +563,16 @@ def create_settlement_journal_entry(vendor_order_id, settlement_amount,
                                      commission_amount=0, reference="",
                                      tds_amount=0):
     """
-    Create a Journal Entry when the platform settles (pays) the vendor.
+    Create a REAL, submitted Journal Entry when the platform settles (pays)
+    the vendor — not a raw GL Entry pair claiming voucher_type="Journal
+    Entry" for a document that doesn't exist (the previous version's
+    docstring already said "Create a Journal Entry"; the implementation
+    didn't, which is exactly the "General Ledger shows it, nothing to click
+    through to" bug this function now actually fixes).
 
     Commission expense and TDS were already recognised at order time (see
-    record_commission_expense / record_tds_withheld) — this entry only
-    moves money:
+    commission_expense_entries / tds_withheld_entries in
+    record_payment_accounting) — this entry only moves money:
 
       DR: Bank/Cash                    (cash actually received)
       CR: SaathiMart Clearing Account  (clears the receivable)
@@ -564,47 +583,49 @@ def create_settlement_journal_entry(vendor_order_id, settlement_amount,
     ITS TDS Receivable). The vendor's clearing receivable nets to exactly
     this gross figure (sale at full base − commission bill incl. its VAT
     + withheld TDS), so this entry zeroes it to the paisa.
-    """
-    # Avoid double-entry
-    if frappe.db.exists("GL Entry", {
-        "voucher_no": vendor_order_id,
-        "voucher_type": "Journal Entry",
-        "remarks": ["like", "%Settlement%"],
-    }):
-        return
 
-    entries = []
-    posting_date = nowdate()
+    Fail-closed: both legs must resolve or nothing posts — the previous
+    version would silently post a single one-sided leg if only one of the
+    two accounts resolved.
+    """
+    hub_ref = f"settlement:{vendor_order_id}"
+    if frappe.db.exists("Journal Entry", {"sm_hub_ref": hub_ref}):
+        return
 
     bank_account = _get_account("cash_bank")
     clearing_account = _get_account("clearing_platform")
-
-    # Bank/Cash debit — actual money received
-    if bank_account:
-        entries.append({
-            "account": bank_account,
-            "debit": flt(settlement_amount, 2),
-            "credit": 0,
-            "remarks": f"Settlement received from SaathiMart for {vendor_order_id}",
-        })
-
-    # Clearing Account credit — clears the receivable
-    if clearing_account:
-        entries.append({
-            "account": clearing_account,
-            "debit": 0,
-            "credit": flt(settlement_amount, 2),
-            "remarks": f"Clearing receivable for {vendor_order_id}",
-        })
-
-    if entries:
-        create_gl_entries_batch(
-            entries,
-            voucher_type="Journal Entry",
-            voucher_no=vendor_order_id,
-            remarks=f"Settlement for {vendor_order_id}" + (f" (ref: {reference})" if reference else ""),
-            posting_date=posting_date,
+    if not (bank_account and clearing_account):
+        frappe.log_error(
+            f"Settlement GL for {vendor_order_id} aborted: bank={bank_account}, "
+            f"clearing={clearing_account} (company {_get_company()}) — nothing posted (fail-closed)",
+            "Vendor Accounting",
         )
+        return
+
+    amount = flt(settlement_amount, 2)
+    je = frappe.new_doc("Journal Entry")
+    je.company = _get_company()
+    je.entry_type = "Bank Entry"
+    je.posting_date = nowdate()
+    je.cheque_no = reference or vendor_order_id
+    je.cheque_date = je.posting_date
+    je.user_remark = f"Settlement for {vendor_order_id}" + (f" (ref: {reference})" if reference else "")
+    je.sm_hub_ref = hub_ref
+
+    row = je.append("accounts", {})
+    row.account = bank_account
+    row.debit_in_account_currency = amount
+    row.credit_in_account_currency = 0
+    row.user_remark = f"Settlement received from SaathiMart for {vendor_order_id}"
+
+    row = je.append("accounts", {})
+    row.account = clearing_account
+    row.debit_in_account_currency = 0
+    row.credit_in_account_currency = amount
+    row.user_remark = f"Clearing receivable for {vendor_order_id}"
+
+    je.insert(ignore_permissions=True)
+    je.submit()
 
 
 # ── TDS Withheld on Commission (Income Tax Act 2058, s88) ───────────────────
@@ -613,37 +634,35 @@ def create_settlement_journal_entry(vendor_order_id, settlement_amount,
 # same moment the commission expense is booked, so the liability never
 # exists without its withholding.
 
-def record_tds_withheld(vendor_order_id, commission_amount, tds_rate=15.0):
+def tds_withheld_entries(vendor_order_id, commission_amount, tds_rate=15.0):
     """
+    Build (never write) the TDS legs:
+
     DR: SaathiMart Clearing   (platform's commission receivable shrinks — the
-                              15% the vendor withholds never leaves for the
-                              platform; it goes to IRD on the vendor's behalf)
+                              withheld % never leaves for the platform; it
+                              goes to IRD on the vendor's behalf)
     CR: TDS Payable           (owed to IRD until the certificate settles it)
 
     Net effect: commission expense still shows gross, TDS Payable shows what
     the vendor must deposit with IRD, and the clearing balance drops by the
     withheld amount — so settlement pays out cash minus TDS, exactly like
-    the hub's settlement JE expects. The previous version credited the
-    commission expense account a second time, which double-counted income
-    and left every TDS voucher unbalanced by exactly the TDS amount.
+    the hub's settlement JE expects.
     """
     tds = rounded(flt(commission_amount) * flt(tds_rate) / 100.0, 2)
     if tds <= 0:
-        return
-
-    if frappe.db.exists("GL Entry", {
-        "voucher_no": vendor_order_id,
-        "voucher_type": "Journal Entry",
-        "remarks": ["like", "%TDS withheld%"],
-    }):
-        return
+        return []
 
     tds_account = _get_account("tds_payable")
     clearing_account = _get_account("clearing_platform")
     if not (tds_account and clearing_account):
-        return
+        frappe.log_error(
+            f"TDS GL for {vendor_order_id} aborted: tds_payable={tds_account}, "
+            f"clearing={clearing_account} (company {_get_company()}) — nothing posted (fail-closed)",
+            "Vendor Accounting",
+        )
+        return []
 
-    create_gl_entries_batch([
+    return [
         {
             "account": tds_account,
             "debit": 0,
@@ -656,63 +675,58 @@ def record_tds_withheld(vendor_order_id, commission_amount, tds_rate=15.0):
             "credit": 0,
             "remarks": f"TDS withheld on commission (s88) for {vendor_order_id}",
         },
-    ], voucher_type="Journal Entry",
-       voucher_no=vendor_order_id,
-       remarks=f"TDS withheld on commission for {vendor_order_id}")
+    ]
 
 
 # ── Commission Expense GL Entries ────────────────────────────────────────────
 
-def record_commission_expense(vendor_order_id, commission_amount, commission_pct):
+def commission_expense_entries(vendor_order_id, commission_amount, commission_pct):
     """
-    Record marketplace commission as an expense for the vendor, with the
-    13% input VAT on the platform's commission bill (the platform invoices
-    commission + service VAT; the vendor claims the VAT as input credit): 
+    Build (never write) the commission expense legs, with the 13% input VAT
+    on the platform's commission bill (the platform invoices commission +
+    service VAT; the vendor claims the VAT as input credit):
 
     DR: Marketplace Commission Expense   (net commission)
     DR: Input VAT                        (13% of commission)
     CR: SaathiMart Clearing Account      (gross payable to platform)
     """
     if flt(commission_amount) <= 0:
-        return
-
-    entries = []
-    posting_date = nowdate()
+        return []
 
     commission_account = _get_account("commission_expense")
     clearing_account = _get_account("clearing_platform")
     input_vat_account = _get_account("vat_input")
 
-    if commission_account and clearing_account:
-        commission_amount = flt(commission_amount, 2)
-        input_vat = rounded(commission_amount * 13.0 / 100.0, 2)
-        entries.append({
-            "account": commission_account,
-            "debit": commission_amount,
-            "credit": 0,
-            "remarks": f"Commission ({commission_pct}%) for {vendor_order_id}",
-        })
-        if input_vat > 0 and input_vat_account:
-            entries.append({
-                "account": input_vat_account,
-                "debit": input_vat,
-                "credit": 0,
-                "remarks": f"Input VAT on commission bill for {vendor_order_id}",
-            })
-        entries.append({
-            "account": clearing_account,
-            "debit": 0,
-            "credit": commission_amount + input_vat,
-            "remarks": f"Commission payable to SaathiMart for {vendor_order_id}",
-        })
-
-        create_gl_entries_batch(
-            entries,
-            voucher_type="Journal Entry",
-            voucher_no=vendor_order_id,
-            remarks=f"Commission expense for {vendor_order_id}",
-            posting_date=posting_date,
+    if not (commission_account and clearing_account):
+        frappe.log_error(
+            f"Commission GL for {vendor_order_id} aborted: commission={commission_account}, "
+            f"clearing={clearing_account} (company {_get_company()}) — nothing posted (fail-closed)",
+            "Vendor Accounting",
         )
+        return []
+
+    commission_amount = flt(commission_amount, 2)
+    input_vat = rounded(commission_amount * 13.0 / 100.0, 2)
+    entries = [{
+        "account": commission_account,
+        "debit": commission_amount,
+        "credit": 0,
+        "remarks": f"Commission ({commission_pct}%) for {vendor_order_id}",
+    }]
+    if input_vat > 0 and input_vat_account:
+        entries.append({
+            "account": input_vat_account,
+            "debit": input_vat,
+            "credit": 0,
+            "remarks": f"Input VAT on commission bill for {vendor_order_id}",
+        })
+    entries.append({
+        "account": clearing_account,
+        "debit": 0,
+        "credit": commission_amount + input_vat,
+        "remarks": f"Commission payable to SaathiMart for {vendor_order_id}",
+    })
+    return entries
 
 
 # ── Platform Coupon Reimbursement GL Entries ─────────────────────────────────
@@ -849,22 +863,34 @@ def create_platform_gl_entries(payload):
     name prefix so they can never collide with this site's own vendor-book
     accounts.
 
-    Idempotent: create_gl_entry dedupes on (account, voucher, amounts,
-    remarks); replayed deliveries are no-ops. Fails closed per batch:
-    any account that cannot be resolved aborts the whole voucher with
-    nothing posted (a half-posted platform ledger would be worse than a
-    delayed one — the hub's drain retries).
+    Books a REAL Journal Entry (submitted) rather than raw GL rows: the
+    controller validates balance, fills currency columns, names the
+    voucher JE-YYYY-NNNNN and makes it visible in the Journal Entry list,
+    GL report drill-down and voucher views — raw inserts named
+    "Payment Entry <order-id>" for a voucher that does not exist left the
+    desk showing empty lists and a ledger of unreferenceable rows.
+
+    Idempotent via the sm_hub_ref custom field: any batch re-delivered
+    with the same hub reference is a no-op. Fails closed per batch: any
+    account that cannot be resolved aborts the whole voucher with nothing
+    posted (a half-posted platform ledger would be worse than a delayed
+    one — the hub's drain retries).
     """
     voucher_type = payload.get("voucher_type") or "Journal Entry"
     voucher_no = payload.get("voucher_no") or ""
     remarks = payload.get("remarks") or ""
     entries = payload.get("entries") or []
+    hub_ref = payload.get("event_id") or f"{voucher_type}:{voucher_no}"
     if not voucher_no or not entries:
         frappe.log_error(
             f"platform.ledger_entry missing voucher_no or entries: {payload}",
             "Platform Ledger Receiver",
         )
         return {"ok": False, "reason": "malformed"}
+
+    # Idempotency — the hub retries deliveries at-least-once.
+    if hub_ref and frappe.db.exists("Journal Entry", {"sm_hub_ref": hub_ref}):
+        return {"ok": True, "entries": 0, "duplicate": True}
 
     # Resolve all accounts FIRST — fail closed before writing anything.
     resolved = []
@@ -901,18 +927,26 @@ def create_platform_gl_entries(payload):
         )
         return {"ok": False, "reason": "unbalanced"}
 
+    je = frappe.new_doc("Journal Entry")
+    je.company = _get_company()
+    je.entry_type = "Journal Entry"
+    je.posting_date = nowdate()
+    je.cheque_no = voucher_no
+    je.cheque_date = je.posting_date
+    je.user_remark = (remarks + (f" — hub voucher {voucher_type} {voucher_no}" if voucher_type != "Journal Entry" else ""))[:300]
+    je.sm_hub_ref = hub_ref
     for e in resolved:
-        create_gl_entry(
-            account=e["account"],
-            debit=e.get("debit", 0),
-            credit=e.get("credit", 0),
-            voucher_type=voucher_type,
-            voucher_no=voucher_no,
-            remarks=e.get("remarks") or remarks,
-            party_type=e.get("party_type"),
-            party=e.get("party"),
-        )
-    return {"ok": True, "entries": len(resolved)}
+        row = je.append("accounts", {})
+        row.account = e["account"]
+        row.debit_in_account_currency = flt(e.get("debit", 0), 2)
+        row.credit_in_account_currency = flt(e.get("credit", 0), 2)
+        if e.get("party_type") and e.get("party"):
+            row.party_type = e["party_type"]
+            row.party = e["party"]
+        row.user_remark = e.get("remarks") or remarks
+    je.insert(ignore_permissions=True)
+    je.submit()
+    return {"ok": True, "entries": len(resolved), "journal_entry": je.name}
 
 
 def get_vendor_gl_entries(vendor_order_id=None, from_date=None, to_date=None):
