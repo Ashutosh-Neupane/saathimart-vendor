@@ -186,8 +186,20 @@ config.service_radius_km = 5
 # so ordering by creation alone always picked the group node — a Bin can
 # never exist there, and every re-registration silently reset stock
 # reading/order fulfillment to a warehouse that can't hold stock.
+# Bins-aware: a pre-existing site may hold stock under a leaf 'Stores'
+# warehouse of ANY of its companies (vendor1 runs two Companies — SaathiMart
+# Vendor/SM and Vendor Test Co/VTC — with 134 Bins under 'Stores - VTC' and
+# none under 'Stores - SM'). Prefer the leaf Stores warehouse that actually
+# holds Bins, so re-registration can't strand order fulfillment on an empty
+# warehouse of the wrong company.
 existing_warehouse = (
     frappe.db.get_value(
+        'Bin',
+        {'warehouse': ['like', 'Stores%'], 'actual_qty': ['>', 0]},
+        'warehouse',
+        order_by='modified desc',
+    )
+    or frappe.db.get_value(
         'Warehouse',
         {'disabled': 0, 'is_group': 0, 'warehouse_name': ['like', '%Stores%']},
         'name',
