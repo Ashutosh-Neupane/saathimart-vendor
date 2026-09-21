@@ -43,8 +43,12 @@ def get_stock_qty(product=None, warehouse=None):
     else:
         item_code = mapping.item_code
 
-    # Determine warehouse
-    wh = warehouse or config.default_warehouse
+    # Determine warehouse — "default" is the hub's placeholder for "unset",
+    # so treat it exactly like None and fall back to our configured default.
+    if warehouse and warehouse != "default":
+        wh = warehouse
+    else:
+        wh = config.default_warehouse
     if warehouse and warehouse != "default":
         # Look up mapped ERPNext warehouse from our warehouse table
         for wh_row in (config.warehouses or []):
