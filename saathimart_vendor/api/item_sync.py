@@ -43,6 +43,21 @@ def _selling_price(item_code: str) -> float:
     return flt(rate or 0)
 
 
+def _specifications(item_doc) -> list:
+	"""Structured specs for the hub Product (rendered as the PDP spec table).
+
+	Source: the ERPNext Item's Website Specifications child rows (label/value
+	pairs). Items without them sync with an empty list — the hub keeps whatever
+	specs it already has (first-sync-wins there).
+	"""
+	specs = []
+	for row in (getattr(item_doc, "website_specifications", None) or []):
+		label = (getattr(row, "label", "") or "").strip()
+		if label:
+			specs.append({"label": label, "value": (getattr(row, "value", "") or "").strip()})
+	return specs
+
+
 def _current_qty(item_code: str, warehouse: str) -> float:
     if not warehouse:
         return 0.0
@@ -119,6 +134,7 @@ def sync_item_to_saathi(item_code: str) -> dict:
             "brand": item.brand or "",
             "description": item.description or "",
             "uom": item.stock_uom or "",
+            "specifications": _specifications(item),
         },
     )
     if not ok:

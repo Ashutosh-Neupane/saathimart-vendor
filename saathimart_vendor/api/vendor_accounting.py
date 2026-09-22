@@ -56,6 +56,41 @@ _ACCOUNT_NAME_MAP = {
 }
 
 
+def _account_overrides():
+    """Admin-set per-account names from Vendor Config > Account Overrides
+    (JSON). These win over every name/fuzzy match — a vendor whose Chart of
+    Accounts uses non-standard names gets exact accounts instead of the
+    fuzzy resolver guessing. Returns {} when unset or invalid (invalid JSON
+    is logged once per resolution, never thrown — the resolver continues
+    with standard names). Cached on frappe.local, so edits apply from the
+    next request without a worker restart.
+    """
+    cached = getattr(frappe.local, "sm_acct_overrides", None)
+    if cached is not None:
+        return cached
+    import json as _json
+    raw = None
+    try:
+        raw = frappe.db.get_single_value("Vendor Config", "account_overrides")
+    except Exception:
+        raw = None
+    parsed = {}
+    if raw and (raw or "").strip():
+        try:
+            parsed = {
+                str(k).strip(): str(v).strip()
+                for k, v in (_json.loads(raw) or {}).items()
+                if str(v).strip()
+            }
+        except Exception:
+            frappe.log_error(
+                f"Vendor Config.account_overrides is not valid JSON: {raw[:200]}",
+                "Vendor Accounting",
+            )
+    frappe.local.sm_acct_overrides = parsed or {}
+    return frappe.local.sm_acct_overrides
+
+
 # Fuzzy fallback: if the exact name doesn't exist, search by keyword
 _FUZZY_FALLBACKS = {
     "cash_bank":              ["Cash In Hand", "Cash", "Bank"],
@@ -89,10 +124,30 @@ def _get_account(account_key):
     if not company:
         return None
 
-    cache_key = f"{company}:{account_key}"
+    # Override value is part of the key: a newly-set/changed Vendor Config
+    # override gets a fresh resolution on the next posting instead of being
+    # short-circuited by a warm cache from the pre-override name.
+    cache_key = f"{company}:{account_key}:{_account_overrides().get(account_key) or ''}"
     cached = _account_cache.get(cache_key)
     if cached and frappe.db.exists("Account", cached):
         return cached
+
+    # 1. Exact override — the admin-set name wins over everything.
+    override = _account_overrides().get(account_key)
+    if override:
+        found = frappe.db.get_value(
+            "Account", {"name": ["like", f"{override}%"], "company": company}, "name"
+        ) or frappe.db.get_value(
+            "Account", {"account_name": ["like", f"{override}%"], "company": company}, "name"
+        )
+        if found:
+            _account_cache[cache_key] = found
+            return found
+        frappe.throw(_(
+            "Vendor Config account override for '{0}' is set to '{1}', but no "
+            "such Account exists for company {2}. Fix or clear the override in "
+            "Vendor Config — GL will not post unbalanced."
+        ).format(account_key, override, company))
 
     # Search by the mapped name (handles company suffix)
     search_name = _ACCOUNT_NAME_MAP.get(account_key, VENDOR_ACCOUNTS.get(account_key, ""))
@@ -129,6 +184,26 @@ def _get_account(account_key):
         if found:
             _account_cache[cache_key] = found
             return found
+
+    # ── Fail LOUD, not silently ─────────────────────────────────────────
+    # The old behaviour returned None, callers guarded each leg with
+    # `if revenue_account:` and the books posted with legs missing —
+    # unbalanced GL that nobody saw until reconciliation. The six core
+    # legs every posting depends on MUST resolve; when they don't, throw so
+    # the event retries (Webhook Event retry/dead-letter machinery owns
+    # the recovery loop) instead of writing broken books. Peripheral keys
+    # (receivable/payable helpers) stay soft — callers legitimately
+    # continue without them.
+    _CORE_ACCOUNT_KEYS = {
+        "cash_bank", "revenue", "vat_output", "clearing_platform",
+        "tds_payable", "commission_expense",
+    }
+    if account_key in _CORE_ACCOUNT_KEYS:
+        frappe.throw(_(
+            "Cannot resolve GL account '{0}' for company {1} — no exact, "
+            "provisioned, or fuzzy match. Create the account (or set a "
+            "Vendor Config override) before posting."
+        ).format(account_key, company))
 
     frappe.log_error(f"Vendor account {account_key} does not exist for company {company}", "Vendor Accounting")
     return None
