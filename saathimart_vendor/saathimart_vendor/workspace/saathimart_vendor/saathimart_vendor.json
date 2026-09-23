@@ -127,6 +127,26 @@
    "label": "Vendor Config",
    "link_to": "/app/vendor-config",
    "type": "URL"
+  },
+  {
+   "label": "Vendor Sales by Product",
+   "link_to": "Vendor Sales by Product",
+   "type": "Report"
+  },
+  {
+   "label": "Vendor Payment Status",
+   "link_to": "Vendor Payment Status",
+   "type": "Report"
+  },
+  {
+   "label": "Sync Outbox Health",
+   "link_to": "Sync Outbox Health",
+   "type": "Report"
+  },
+  {
+   "label": "Sync Outbox",
+   "link_to": "Sync Outbox",
+   "type": "DocType"
   }
  ],
  "title": "SaathiMart Vendor"

@@ -53,7 +53,12 @@ doc_events = {
 # keyed by the hub's own event_id; the receiver dedupes re-deliveries on
 # this column so at-least-once delivery can never double-book the
 # platform's books. Fields themselves are created in setup.py.
-after_migrate = "saathimart_vendor.setup.ensure_custom_fields"
+after_migrate = [
+	"saathimart_vendor.setup.ensure_custom_fields",
+	# DB-resident Query Reports (the image ships the app read-only, so
+	# file-based Script Reports can't be relied on everywhere).
+	"saathimart_vendor.api.report_setup.install_vendor_reports",
+]
 
 
 # ── Scheduled tasks ───────────────────────────────────────────────────
