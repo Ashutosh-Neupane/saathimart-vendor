@@ -3,7 +3,7 @@ from frappe.model.document import Document
 
 
 class VendorConfig(Document):
-	_SECRET_FIELDS = ("webhook_secret", "webhook_secret_old", "webhook_secret_next", "api_secret")
+	_SECRET_FIELDS = ("webhook_secret", "webhook_secret_old", "webhook_secret_next")
 
 	def validate(self):
 		if self.hub_url:

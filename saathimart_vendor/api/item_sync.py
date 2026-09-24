@@ -165,12 +165,17 @@ def sync_item_to_saathi(item_code: str) -> dict:
     # rather than crashing — `mapping` was never a loaded document here,
     # only `mapping_name` (its docname) was.
     product_ref = product or frappe.db.get_value("Product Mapping", mapping_name, "hub_product_id") or ""
+    # Links shown to the admin must be browser-reachable: config.hub_url is
+    # often a Docker service name (http://hub:8000) that only resolves
+    # inside the compose network. public_hub_url is the address a human
+    # opens; fall back to hub_url when it isn't set.
+    link_base = (config.public_hub_url or config.hub_url or "").rstrip("/")
     return {
         "ok": True,
         "item_code": item_code,
         "barcode": barcode,
         "hub_product": product_ref,
-        "product_url": f"{config.hub_url}/app/product/{product_ref}" if product_ref else "",
+        "product_url": f"{link_base}/app/product/{product_ref}" if product_ref else "",
         "listing": listing,
         "listing_created": bool(created),
         "price": price,

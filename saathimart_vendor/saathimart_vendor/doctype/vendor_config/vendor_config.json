@@ -7,7 +7,7 @@
   {
    "fieldname": "section_hub",
    "fieldtype": "Section Break",
-   "label": "🔗 Hub Connection"
+   "label": "\ud83d\udd17 Hub Connection"
   },
   {
    "fieldname": "hub_url",
@@ -22,7 +22,7 @@
    "label": "Hub Site",
    "reqd": 1,
    "default": "saathimart.localhost",
-   "description": "Frappe site name on the hub bench, sent as the Host header — hub_url is often a Docker service name (e.g. http://hub:8000), which is not itself a valid Frappe site"
+   "description": "Frappe site name on the hub bench, sent as the Host header \u2014 hub_url is often a Docker service name (e.g. http://hub:8000), which is not itself a valid Frappe site"
   },
   {
    "fieldname": "vendor_id",
@@ -30,20 +30,6 @@
    "label": "Vendor ID",
    "reqd": 1,
    "description": "Assigned by SaathiMart admin e.g. vendor-a"
-  },
-  {
-   "fieldname": "api_key",
-   "fieldtype": "Data",
-   "label": "API Key",
-   "reqd": 0,
-   "description": "Legacy token-auth credential, unused by current HMAC-based hub sync (see webhook_secret below)."
-  },
-  {
-   "fieldname": "api_secret",
-   "fieldtype": "Password",
-   "label": "API Secret",
-   "reqd": 0,
-   "description": "Legacy token-auth credential, unused by current HMAC-based hub sync (see webhook_secret below)."
   },
   {
    "fieldname": "webhook_secret",
@@ -68,6 +54,17 @@
    "fieldtype": "Column Break"
   },
   {
+   "fieldtype": "Column Break",
+   "fieldname": "cb_public"
+  },
+  {
+   "fieldtype": "Data",
+   "fieldname": "public_hub_url",
+   "label": "Public Hub URL",
+   "description": "Browser-reachable hub address (e.g. http://saathimart.localhost:8000). Used for links shown to admins \u2014 the Docker-internal hub_url stays the machine-to-machine endpoint.",
+   "no_copy": 1
+  },
+  {
    "fieldname": "sync_enabled",
    "fieldtype": "Check",
    "label": "Sync Enabled",
@@ -78,7 +75,7 @@
    "fieldtype": "Data",
    "label": "Hub Status",
    "read_only": 1,
-   "description": "Active / Unreachable — updated every 5 min"
+   "description": "Active / Unreachable \u2014 updated every 5 min"
   },
   {
    "fieldname": "last_sync_at",
@@ -109,7 +106,7 @@
   {
    "fieldname": "section_warehouse",
    "fieldtype": "Section Break",
-   "label": "🏭 Warehouse"
+   "label": "\ud83c\udfed Warehouse"
   },
   {
    "fieldname": "warehouses",
@@ -132,7 +129,7 @@
   {
    "fieldname": "section_location",
    "fieldtype": "Section Break",
-   "label": "📍 Location"
+   "label": "\ud83d\udccd Location"
   },
   {
    "fieldname": "lat",
@@ -160,7 +157,7 @@
   {
    "fieldname": "section_reconciliation",
    "fieldtype": "Section Break",
-   "label": "⚖️ Reconciliation"
+   "label": "\u2696\ufe0f Reconciliation"
   },
   {
    "fieldname": "section_account_overrides",
@@ -171,7 +168,7 @@
    "fieldname": "account_overrides",
    "fieldtype": "Small Text",
    "label": "GL Account Overrides (JSON)",
-   "description": "Optional JSON mapping: {\"revenue\": \"Sales - SM\", \"vat_output\": \"VAT Payable 13%\", ...}. Keys: cash_bank, revenue, vat_output, vat_input, clearing_platform, tds_payable, commission_expense, platform_coupon_income, loyalty_income, accounts_receivable, accounts_payable. Set by the platform admin from the hub Vendor → Accounting tab; unresolvable accounts fail loudly instead of posting unbalanced GL."
+   "description": "Optional JSON mapping: {\"revenue\": \"Sales - SM\", \"vat_output\": \"VAT Payable 13%\", ...}. Keys: cash_bank, revenue, vat_output, vat_input, clearing_platform, tds_payable, commission_expense, platform_coupon_income, loyalty_income, accounts_receivable, accounts_payable. Set by the platform admin from the hub Vendor \u2192 Accounting tab; unresolvable accounts fail loudly instead of posting unbalanced GL."
   },
   {
    "fieldname": "reconciliation_enabled",

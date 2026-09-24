@@ -43,19 +43,17 @@ from frappe.utils import flt, now_datetime, today, getdate
 # after — without touching the many individual tests that rely on it being
 # mutable mid-suite.
 _VENDOR_CONFIG_FIELDS = [
-    "hub_url", "vendor_id", "api_key", "sync_enabled",
+    "hub_url", "vendor_id", "sync_enabled",
     "reconciliation_enabled", "default_warehouse", "lat", "lng",
 ]
 _original_vendor_config = None
-_original_vendor_api_secret = None
 
 
 def setUpModule():
-    global _original_vendor_config, _original_vendor_api_secret
+    global _original_vendor_config
     frappe.set_user("Administrator")
     doc = frappe.get_single("Vendor Config")
     _original_vendor_config = {f: doc.get(f) for f in _VENDOR_CONFIG_FIELDS}
-    _original_vendor_api_secret = doc.get_password("api_secret", raise_exception=False)
     # Bare test DBs have none of the ERPNext masters (Item Groups, UOMs,
     # Price Lists) that the suite relies on — seed them up front.
     _ensure_base_fixtures()
@@ -68,8 +66,6 @@ def tearDownModule():
     doc = frappe.get_single("Vendor Config")
     for field, value in _original_vendor_config.items():
         doc.set(field, value)
-    if _original_vendor_api_secret is not None:
-        doc.api_secret = _original_vendor_api_secret
     doc.flags.ignore_mandatory = True
     doc.save(ignore_permissions=True)
     frappe.db.commit()
@@ -197,8 +193,6 @@ def _configure_vendor(vendor_id="vendor-test-a", hub_url="http://hub:8000",
     doc = frappe.get_single("Vendor Config")
     doc.hub_url = hub_url
     doc.vendor_id = vendor_id
-    doc.api_key = "test-api-key"
-    doc.api_secret = "test-api-secret"
     doc.sync_enabled = sync_enabled
     doc.reconciliation_enabled = reconciliation_enabled
     doc.default_warehouse = warehouse or _ensure_warehouse()
